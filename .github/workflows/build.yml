@@ -28,6 +28,8 @@ env:
   # AOSP Clang 21.0.0 r563880c (same toolchain as the stock Spiteful kernel), pinned commit
   CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/f8439f0628d799092dd07df440a6334cab28939c/clang-r563880c.tar.gz
   CLANG_ID: r563880c
+  KSU_VERSION: "33214"   # KernelSU-Next v3.3.0 (ksuver), ubah ikut manager anda
+  KSU_TAG: "v3.3.0"
   KBUILD_BUILD_USER: PsychoAvy
   KBUILD_BUILD_HOST: github
 
@@ -93,6 +95,8 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
+            KSU_VERSION_OVERRIDE="${KSU_VERSION}" \
+            KSU_VERSION_TAG_OVERRIDE="${KSU_TAG}" \
             2>&1 | tee build.log
 
       - name: Show build errors
