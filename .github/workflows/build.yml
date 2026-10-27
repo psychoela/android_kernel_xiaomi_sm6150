@@ -35,6 +35,9 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout kernel source
         uses: actions/checkout@v4
@@ -91,6 +94,13 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             2>&1 | tee build.log
+
+      - name: Show build errors
+        if: failure()
+        run: |
+          grep -nE "error:|\*\*\*|undefined reference|ld.lld:" build.log | head -40 || true
+          echo "---- last 30 lines ----"
+          tail -30 build.log || true
 
       - name: Verify result
         id: verify
