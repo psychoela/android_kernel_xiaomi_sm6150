@@ -34,6 +34,9 @@ env:
   # susfs4ksu ref for kernel 4.14. Branch head (kernel-4.14, susfs 1.5.5) does NOT patch cleanly into
   # this KernelSU-Next v3.4.0-legacy tree (different file layout); the 1.4.2 tag built fine before.
   SUSFS_REF: 1.4.2-kernel-4.14
+  # Build-time SUSFS patching does not work with KernelSU-Next v3.4.0-legacy (new file layout).
+  # Leave "false" and keep SUSFS in the source tree instead (see chat), or set "true" to retry patching.
+  SUSFS_PATCH: "false"
   KBUILD_BUILD_USER: PsychoAvy
   KBUILD_BUILD_HOST: github
 
@@ -82,6 +85,7 @@ jobs:
           grep -rIl "ksu_handle" fs kernel drivers/input 2>/dev/null | head
 
       - name: Add SUSFS (susfs4ksu ${{ env.SUSFS_REF }})
+        if: env.SUSFS_PATCH == 'true'
         run: |
           set -e
           git clone --depth=1 -b "$SUSFS_REF" https://gitlab.com/simonpunk/susfs4ksu.git "$RUNNER_TEMP/susfs4ksu"
@@ -118,14 +122,20 @@ jobs:
       - name: Configure kernel
         run: |
           make O=out ARCH=arm64 "$DEFCONFIG"
-          # SUSFS: manual hooks are used, so SUS_SU (kprobe-based) stays off
-          scripts/config --file out/.config -e KSU_SUSFS \
-            -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT -e KSU_SUSFS_SUS_OVERLAYFS \
-            -e KSU_SUSFS_TRY_UMOUNT -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_OPEN_REDIRECT \
-            -e KSU_SUSFS_ENABLE_LOG -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS -e KSU_SUSFS_SPOOF_BOOTCONFIG \
-            -d KSU_SUSFS_SUS_SU
-          make O=out ARCH=arm64 olddefconfig
-          grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "::error::CONFIG_KSU_SUSFS=y is not set in the final config"; exit 1; }
+          # SUSFS: only touched when the source tree actually carries it (fs/susfs.c). Manual hooks
+          # are used, so SUS_SU (kprobe-based) stays off.
+          if [ -f fs/susfs.c ]; then
+            echo "SUSFS found in source tree, enabling"
+            scripts/config --file out/.config -e KSU_SUSFS \
+              -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT -e KSU_SUSFS_SUS_OVERLAYFS \
+              -e KSU_SUSFS_TRY_UMOUNT -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_OPEN_REDIRECT \
+              -e KSU_SUSFS_ENABLE_LOG -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS -e KSU_SUSFS_SPOOF_BOOTCONFIG \
+              -d KSU_SUSFS_SUS_SU
+            make O=out ARCH=arm64 olddefconfig
+            grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "::error::CONFIG_KSU_SUSFS=y is not set in the final config"; exit 1; }
+          else
+            echo "::warning::No fs/susfs.c in source tree, building WITHOUT SUSFS"
+          fi
           if [ "${{ inputs.disable_lto }}" = "true" ]; then
             scripts/config --file out/.config -d LTO_CLANG -d THINLTO -e LTO_NONE
             make O=out ARCH=arm64 olddefconfig
@@ -176,8 +186,8 @@ jobs:
           fi
           echo "KernelSU strings found in Image: $COUNT"
           SUSFS_COUNT="$(strings -n 6 out/arch/arm64/boot/Image | grep -ci "susfs" || true)"
-          if [ "${SUSFS_COUNT:-0}" -eq 0 ]; then
-            echo "::error::No SUSFS strings found in the kernel image"; exit 1
+          if [ -f fs/susfs.c ] && [ "${SUSFS_COUNT:-0}" -eq 0 ]; then
+            echo "::error::fs/susfs.c exists but no SUSFS strings found in the kernel image"; exit 1
           fi
           echo "SUSFS strings found in Image: $SUSFS_COUNT"
 
@@ -194,7 +204,7 @@ jobs:
           cat > AnyKernel3/anykernel.sh <<'EOF'
           # AnyKernel3 Ramdisk Mod Script
           properties() { '
-          kernel.string=Spiteful (KernelSU Next + SUSFS) for sweet by PsychoAvy
+          kernel.string=Spiteful (KernelSU Next) for sweet by PsychoAvy
           do.devicecheck=1
           do.modules=0
           do.systemless=0
@@ -234,7 +244,8 @@ jobs:
           {
             echo "Kernel: ${{ steps.verify.outputs.krel }}"
             echo "Source: ${{ github.repository }}@${{ steps.pack.outputs.short }} (branch ${{ github.ref_name }})"
-            echo "Root: KernelSU Next (legacy, manual hooks) + SUSFS (susfs4ksu ${SUSFS_REF})"
+            if [ -f fs/susfs.c ]; then SUS="SUSFS"; else SUS="no SUSFS"; fi
+            echo "Root: KernelSU Next (legacy, manual hooks), ${SUS}"
             echo "Toolchain: AOSP Clang ${CLANG_ID}"
             echo "LTO disabled: ${{ inputs.disable_lto }}"
             echo
