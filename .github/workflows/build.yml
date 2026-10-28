@@ -133,7 +133,11 @@ jobs:
       - name: Package AnyKernel3 zip
         id: pack
         run: |
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          # Pinned: AnyKernel3 master on 2026-10-26/27 had a split_boot() bug ("Splitting image failed")
+          AK3_SHA=c072981836cd3ee46ad52a5f2cba76ecb927cb1b
+          git init -q AnyKernel3
+          git -C AnyKernel3 fetch -q --depth=1 https://github.com/osm0sis/AnyKernel3 "$AK3_SHA"
+          git -C AnyKernel3 checkout -q FETCH_HEAD
           rm -rf AnyKernel3/.git AnyKernel3/.github AnyKernel3/README.md \
                  AnyKernel3/modules AnyKernel3/patch AnyKernel3/ramdisk
           cat > AnyKernel3/anykernel.sh <<'EOF'
