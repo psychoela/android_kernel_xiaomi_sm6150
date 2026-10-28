@@ -1,5 +1,3 @@
-
-# rebuild susfs 1.5.5
 name: build
 
 # Builds tbyool/android_kernel_xiaomi_sm6150 (branch ksu-next, KernelSU Next legacy +
@@ -33,8 +31,9 @@ env:
   # KernelSU-Next "legacy" branch @165b87f (v3.4.0-legacy + fixes), ksuver = 30000 + 3027 commits + 289
   KSU_VERSION: "33316"
   KSU_TAG: "v3.4.0-legacy"
-  # susfs4ksu branch for kernel 4.14 (branch head = susfs 1.5.5; the module needs v1.5.3+)
-  SUSFS_REF: kernel-4.14
+  # susfs4ksu ref for kernel 4.14. Branch head (kernel-4.14, susfs 1.5.5) does NOT patch cleanly into
+  # this KernelSU-Next v3.4.0-legacy tree (different file layout); the 1.4.2 tag built fine before.
+  SUSFS_REF: 1.4.2-kernel-4.14
   KBUILD_BUILD_USER: PsychoAvy
   KBUILD_BUILD_HOST: github
 
@@ -93,11 +92,12 @@ jobs:
           cp "$SP"/include/linux/* include/linux/
           # kernel-side patch
           patch -p1 -F3 --no-backup-if-mismatch < "$SP/50_add_susfs_in_kernel-4.14.patch" || FAIL=1
+          echo "---- KernelSU-Next/kernel layout ----"; (cd KernelSU-Next && find kernel -maxdepth 2 -type f | sort | head -60)
           # KernelSU-Next side patch: try the KernelSU-Next specific SUSFS patch first
           # (sidex15, susfs 1.5.3), then fall back to simonpunk's generic one
           KSUN_OK=0
           if curl -fsSL -o "$RUNNER_TEMP/ksun-susfs.patch" https://github.com/sidex15/KernelSU-Next/commit/1e750de25930e875612bbec0410de0088474c00b.patch; then
-            if (cd KernelSU-Next && patch -p1 -F3 --dry-run < "$RUNNER_TEMP/ksun-susfs.patch" >/dev/null); then
+            if (cd KernelSU-Next && patch -p1 -F3 --dry-run < "$RUNNER_TEMP/ksun-susfs.patch"); then
               (cd KernelSU-Next && patch -p1 -F3 --no-backup-if-mismatch < "$RUNNER_TEMP/ksun-susfs.patch") && KSUN_OK=1
               echo "Applied sidex15 KernelSU-Next SUSFS patch"
             else
@@ -243,3 +243,4 @@ jobs:
           gh release create "$TAG" "${{ steps.pack.outputs.zip }}" \
             --title "sweet KSUN ${{ steps.pack.outputs.short }} (run ${{ github.run_number }})" \
             --notes-file notes.txt
+            
