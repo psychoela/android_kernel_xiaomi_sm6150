@@ -31,12 +31,11 @@ env:
   # KernelSU-Next "legacy" branch @165b87f (v3.4.0-legacy + fixes), ksuver = 30000 + 3027 commits + 289
   KSU_VERSION: "33316"
   KSU_TAG: "v3.4.0-legacy"
-  # susfs4ksu ref for kernel 4.14. Branch head (kernel-4.14, susfs 1.5.5) does NOT patch cleanly into
-  # this KernelSU-Next v3.4.0-legacy tree (different file layout); the 1.4.2 tag built fine before.
-  SUSFS_REF: 1.4.2-kernel-4.14
-  # Build-time SUSFS patching does not work with KernelSU-Next v3.4.0-legacy (new file layout).
-  # Leave "false" and keep SUSFS in the source tree instead (see chat), or set "true" to retry patching.
-  SUSFS_PATCH: "false"
+  # SUSFS 2.3.0: core (fs/susfs.c + kernel hooks) is cherry-picked from tbyool/android_kernel_xiaomi_sm6150
+  # (commit "treewide: Import SUSFS 2.3.0"); the KernelSU-Next side is wired in by the glue script below.
+  # Set to "false" to build without SUSFS.
+  SUSFS_PATCH: "true"
+  SUSFS_CORE_COMMIT: 412885cb8318
   KBUILD_BUILD_USER: PsychoAvy
   KBUILD_BUILD_HOST: github
 
@@ -84,54 +83,145 @@ jobs:
           grep -rn "^config KSU" KernelSU-Next/kernel/Kconfig || true
           grep -rIl "ksu_handle" fs kernel drivers/input 2>/dev/null | head
 
-      - name: Add SUSFS (susfs4ksu ${{ env.SUSFS_REF }})
+      - name: Add SUSFS 2.3.0 (tbyool core + KernelSU-Next glue)
         if: env.SUSFS_PATCH == 'true'
         run: |
           set -e
-          git clone --depth=1 -b "$SUSFS_REF" https://gitlab.com/simonpunk/susfs4ksu.git "$RUNNER_TEMP/susfs4ksu"
-          SP="$RUNNER_TEMP/susfs4ksu/kernel_patches"
-          ls -R "$SP" | head -30
-          # new SUSFS source files
-          cp "$SP"/fs/* fs/
-          cp "$SP"/include/linux/* include/linux/
-          # kernel-side patch
-          patch -p1 -F3 --no-backup-if-mismatch < "$SP/50_add_susfs_in_kernel-4.14.patch" || FAIL=1
-          echo "---- KernelSU-Next/kernel layout ----"; (cd KernelSU-Next && find kernel -maxdepth 2 -type f | sort | head -60)
-          # KernelSU-Next side patch: try the KernelSU-Next specific SUSFS patch first
-          # (sidex15, susfs 1.5.3), then fall back to simonpunk's generic one
-          KSUN_OK=0
-          if curl -fsSL -o "$RUNNER_TEMP/ksun-susfs.patch" https://github.com/sidex15/KernelSU-Next/commit/1e750de25930e875612bbec0410de0088474c00b.patch; then
-            if (cd KernelSU-Next && patch -p1 -F3 --dry-run < "$RUNNER_TEMP/ksun-susfs.patch"); then
-              (cd KernelSU-Next && patch -p1 -F3 --no-backup-if-mismatch < "$RUNNER_TEMP/ksun-susfs.patch") && KSUN_OK=1
-              echo "Applied sidex15 KernelSU-Next SUSFS patch"
-            else
-              echo "sidex15 patch does not apply cleanly, trying generic patch"
-            fi
-          fi
-          if [ "$KSUN_OK" = "0" ]; then
-            cp "$SP/KernelSU/10_enable_susfs_for_ksu.patch" KernelSU-Next/
-            (cd KernelSU-Next && patch -p1 -F3 --no-backup-if-mismatch < 10_enable_susfs_for_ksu.patch) || FAIL=1
-          fi
-          if [ "${FAIL:-0}" = "1" ]; then
-            echo "::error::SUSFS patch had failed hunks, see .rej files below"
-            find . -name "*.rej" -not -path "./out/*" -print -exec cat {} \;
+          git config user.name "ci"
+          git config user.email "ci@localhost"
+          git remote add tbyool https://github.com/tbyool/android_kernel_xiaomi_sm6150
+          for d in 30 100 300 800 2000; do
+            git fetch --no-tags --depth=$d --filter=blob:none tbyool staging-buildout
+            if git rev-parse -q --verify "${SUSFS_CORE_COMMIT}~1" >/dev/null; then break; fi
+          done
+          git rev-parse --verify "${SUSFS_CORE_COMMIT}~1" >/dev/null || { echo "::error::SUSFS core commit ${SUSFS_CORE_COMMIT} not found"; exit 1; }
+          git show --stat --format='%h %s' "$SUSFS_CORE_COMMIT" | head -30
+          if ! git cherry-pick -n "$SUSFS_CORE_COMMIT"; then
+            echo "::error::cherry-pick of the SUSFS core failed"
+            git status --short | head -40
             exit 1
           fi
-          grep -n "config KSU_SUSFS" KernelSU-Next/kernel/Kconfig | head -20
+          test -f fs/susfs.c
+          grep -n "susfs" fs/Makefile
+          python3 - <<'PY'
+          import re, pathlib, sys
+
+          K = pathlib.Path("KernelSU-Next/kernel")
+
+          def edit(rel, fn):
+              p = K / rel
+              s = p.read_text()
+              n = fn(s)
+              if n == s:
+                  sys.exit("glue: nothing changed in %s (anchor not found or already patched)" % rel)
+              p.write_text(n)
+              print("glue: patched", rel)
+
+          # ---- 1. Kconfig: SUSFS options (2.3.0 names)
+          OPTS = [
+              ("SUS_PATH", "Hide suspicious paths (sus_path)"),
+              ("SUS_MOUNT", "Hide suspicious mounts (sus_mount)"),
+              ("SUS_KSTAT", "Spoof kstat of suspicious files (sus_kstat)"),
+              ("SPOOF_UNAME", "Spoof uname"),
+              ("ENABLE_LOG", "Enable SUSFS logging"),
+              ("HIDE_KSU_SUSFS_SYMBOLS", "Hide KernelSU and SUSFS symbols"),
+              ("SPOOF_CMDLINE_OR_BOOTCONFIG", "Spoof /proc/cmdline or bootconfig"),
+              ("OPEN_REDIRECT", "Redirect opened files (open_redirect)"),
+              ("SUS_MAP", "Hide suspicious memory maps (sus_map)"),
+          ]
+
+          def kconfig(s):
+              if "config KSU_SUSFS" in s:
+                  return s
+              blk = "\nconfig KSU_SUSFS\n\tbool \"KernelSU addon - SUSFS\"\n\tdepends on KSU=y\n\tdefault y\n\thelp\n\t  Hide KernelSU traces from apps. Needs the SUSFS core in the kernel\n\t  source (fs/susfs.c, include/linux/susfs*.h).\n"
+              for name, desc in OPTS:
+                  blk += "\nconfig KSU_SUSFS_%s\n\tbool \"%s\"\n\tdepends on KSU_SUSFS\n\tdefault y\n" % (name, desc)
+              i = s.rindex("endmenu")
+              return s[:i] + blk.lstrip("\n") + "\n" + s[i:]
+          edit("Kconfig", kconfig)
+
+          # ---- 2. selinux.c: domain helper used by susfs.c
+          def selinux(s):
+              if "susfs_is_current_ksu_domain" in s:
+                  return s
+              pat = re.compile(r"(bool is_ksu_domain\(void\)\s*\{[^}]*\}\n)")
+              add = "\n#ifdef CONFIG_KSU_SUSFS\nbool susfs_is_current_ksu_domain(void)\n{\n    return is_ksu_domain();\n}\n#endif\n"
+              return pat.sub(lambda m: m.group(1) + add, s, count=1)
+          edit("selinux/selinux.c", selinux)
+
+          # ---- 3. init.c: susfs_init() right after ksu_cred is ready
+          def init(s):
+              if "susfs_init" in s:
+                  return s
+              s = s.replace('#include "feature/adb_root.h"\n',
+                            '#include "feature/adb_root.h"\n#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs.h>\n#endif\n', 1)
+              pat = re.compile(r"^([ \t]*)ksu_feature_init\(\);", re.M)
+              return pat.sub(lambda m: "#ifdef CONFIG_KSU_SUSFS\n\tsusfs_init();\n#endif\n\n" + m.group(0), s, count=1)
+          edit("core/init.c", init)
+
+          # ---- 4. supercall.c: ksu_susfs commands arrive through the reboot hook
+          CMDS = [
+              ("CMD_SUSFS_ADD_SUS_PATH", "susfs_add_sus_path", "SUS_PATH"),
+              ("CMD_SUSFS_ADD_SUS_PATH_LOOP", "susfs_add_sus_path_loop", "SUS_PATH"),
+              ("CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS", "susfs_set_hide_sus_mnts_for_non_su_procs", "SUS_MOUNT"),
+              ("CMD_SUSFS_ADD_SUS_KSTAT", "susfs_add_sus_kstat", "SUS_KSTAT"),
+              ("CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY", "susfs_add_sus_kstat", "SUS_KSTAT"),
+              ("CMD_SUSFS_UPDATE_SUS_KSTAT", "susfs_update_sus_kstat", "SUS_KSTAT"),
+              ("CMD_SUSFS_SET_UNAME", "susfs_set_uname", "SPOOF_UNAME"),
+              ("CMD_SUSFS_ENABLE_LOG", "susfs_enable_log", "ENABLE_LOG"),
+              ("CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG", "susfs_set_cmdline_or_bootconfig", "SPOOF_CMDLINE_OR_BOOTCONFIG"),
+              ("CMD_SUSFS_ADD_OPEN_REDIRECT", "susfs_add_open_redirect", "OPEN_REDIRECT"),
+              ("CMD_SUSFS_ADD_SUS_MAP", "susfs_add_sus_map", "SUS_MAP"),
+              ("CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING", "susfs_set_avc_log_spoofing", None),
+              ("CMD_SUSFS_SHOW_ENABLED_FEATURES", "susfs_get_enabled_features", None),
+              ("CMD_SUSFS_SHOW_VARIANT", "susfs_show_variant", None),
+              ("CMD_SUSFS_SHOW_VERSION", "susfs_show_version", None),
+          ]
+
+          def supercall(s):
+              if "SUSFS_MAGIC" in s:
+                  return s
+              blk = "#ifdef CONFIG_KSU_SUSFS\n\tif (magic2 == SUSFS_MAGIC) {\n\t\t/* ksu_susfs runs as root */\n\t\tif (current_uid().val != 0)\n\t\t\treturn 0;\n"
+              for cmd, fn, cfg in CMDS:
+                  if cfg:
+                      blk += "#ifdef CONFIG_KSU_SUSFS_%s\n" % cfg
+                  blk += "\t\tif (cmd == %s) {\n\t\t\t%s(arg);\n\t\t\treturn 0;\n\t\t}\n" % (cmd, fn)
+                  if cfg:
+                      blk += "#endif\n"
+              blk += "\t\treturn 0;\n\t}\n#endif\n\n"
+              s = s.replace('#include "sulog/event.h"\n',
+                            '#include "sulog/event.h"\n#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs.h>\n#endif\n', 1)
+              pat = re.compile(r"^[ \t]*// extensions[ \t]*$", re.M)
+              if not pat.search(s):
+                  return s
+              return pat.sub(lambda m: blk + m.group(0), s, count=1)
+          edit("supercall/supercall.c", supercall)
+
+          # ---- 5. kernel_umount.c: mark umounted app processes for SUSFS
+          def umount(s):
+              if "susfs_set_current_proc_umounted" in s:
+                  return s
+              s = s.replace('#include "compat/kernel_compat.h"\n',
+                            '#include "compat/kernel_compat.h"\n#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n', 1)
+              # with SUSFS the sus_* hiding must apply even if no module uses a real mount (NoMount)
+              pat = re.compile(r"([ \t]*// if there isn't any module mounted, just ignore it!\s*\n[ \t]*if \(!ksu_module_mounted\) \{\s*\n[ \t]*return 0;\s*\n[ \t]*\}\n)")
+              s = pat.sub(lambda m: "#ifndef CONFIG_KSU_SUSFS\n" + m.group(1) + "#endif\n", s, count=1)
+              pat2 = re.compile(r"^([ \t]*)tw = kzalloc\(sizeof\(\*tw\), GFP_ATOMIC\);", re.M)
+              return pat2.sub(lambda m: "#ifdef CONFIG_KSU_SUSFS\n\tsusfs_set_current_proc_umounted();\n#endif\n\n" + m.group(0), s, count=1)
+          edit("feature/kernel_umount.c", umount)
+          print("glue: done")
+          PY
+          git status --short | head -40
 
       - name: Configure kernel
         run: |
           make O=out ARCH=arm64 "$DEFCONFIG"
-          # SUSFS: only touched when the source tree actually carries it (fs/susfs.c). Manual hooks
-          # are used, so SUS_SU (kprobe-based) stays off.
+          # SUSFS: Kconfig defaults enable every SUSFS option once KSU_SUSFS is on (see glue script)
           if [ -f fs/susfs.c ]; then
             echo "SUSFS found in source tree, enabling"
-            scripts/config --file out/.config -e KSU_SUSFS \
-              -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT -e KSU_SUSFS_SUS_OVERLAYFS \
-              -e KSU_SUSFS_TRY_UMOUNT -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_OPEN_REDIRECT \
-              -e KSU_SUSFS_ENABLE_LOG -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS -e KSU_SUSFS_SPOOF_BOOTCONFIG \
-              -d KSU_SUSFS_SUS_SU
+            scripts/config --file out/.config -e KSU_SUSFS
             make O=out ARCH=arm64 olddefconfig
+            grep "^CONFIG_KSU_SUSFS" out/.config
             grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "::error::CONFIG_KSU_SUSFS=y is not set in the final config"; exit 1; }
           else
             echo "::warning::No fs/susfs.c in source tree, building WITHOUT SUSFS"
