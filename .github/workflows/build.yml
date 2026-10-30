@@ -257,8 +257,32 @@ jobs:
                   p.write_text(new)
               print("glue: %-28s %s" % (rel, msg))
 
+          # ---- 7. fs/stat.c: newfstat hook. The init.rc proxy only works if init sees a bigger st_size
+          #         (init reads exactly st_size bytes, so without this it never reaches EOF and ksud is never started)
+          def stat_hook(text):
+              if "ksu_handle_newfstat_ret" in text:
+                  return text, "already hooked"
+              m = re.search(r"^SYSCALL_DEFINE2\(newfstat,.*?^\}\n", text, re.S | re.M)
+              if not m:
+                  sys.exit("glue: SYSCALL_DEFINE2(newfstat) not found in fs/stat.c")
+              body = m.group(0)
+              if "\treturn error;\n}" not in body:
+                  sys.exit("glue: unexpected newfstat body in fs/stat.c:\n" + body)
+              new = body.replace("\treturn error;\n}",
+                                 "#ifdef CONFIG_KSU\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif\n\treturn error;\n}", 1)
+              decl = ("#ifdef CONFIG_KSU\nextern void ksu_handle_newfstat_ret(unsigned int *fd, "
+                      "struct stat __user **statbuf_ptr);\n#endif\n\n")
+              return text[:m.start()] + decl + new + text[m.end():], "newfstat hook added"
+
+          _p = ROOT / "fs/stat.c"
+          _new, _msg = stat_hook(_p.read_text())
+          if _new != _p.read_text():
+              _p.write_text(_new)
+          print("glue: fs/stat.c", _msg)
+
           print("glue: done")
           PY
+          grep -n -B2 -A2 ksu_handle_newfstat_ret fs/stat.c
           git status --short | head -40
 
       - name: Configure kernel
