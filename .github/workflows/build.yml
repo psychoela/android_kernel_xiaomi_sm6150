@@ -182,11 +182,11 @@ jobs:
           cp -v "$P"/fs/*.c fs/
           cp -v "$P"/include/linux/*.h include/linux/
           echo "---- 1/2: KernelSU side patch (dry run first) ----"
-          ( cd KernelSU && patch -p1 --dry-run < "$SPATCH" ) \
+          ( cd KernelSU && patch -p1 --batch --dry-run < "$SPATCH" ) \
             || { echo "::error::SUSFS KernelSU-side patch does not apply to backslashxx/KernelSU"; exit 1; }
-          ( cd KernelSU && patch -p1 --no-backup-if-mismatch < "$SPATCH" )
+          ( cd KernelSU && patch -p1 --batch --no-backup-if-mismatch < "$SPATCH" )
           echo "---- 2/2: kernel side patch ----"
-          patch -p1 --no-backup-if-mismatch < "$KPATCH" || {
+          patch -p1 --batch --no-backup-if-mismatch < "$KPATCH" || {
             echo "::error::SUSFS kernel patch has failing hunks (see .rej files below)"
             find . -name '*.rej' -not -path './out/*' | head -20
             for f in $(find . -name '*.rej' -not -path './out/*' | head -5); do echo "=== $f ==="; cat "$f"; done
