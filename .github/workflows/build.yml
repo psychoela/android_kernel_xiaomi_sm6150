@@ -426,6 +426,73 @@ jobs:
       - name: Configure kernel
         run: |
           make O=out ARCH=arm64 "$DEFCONFIG"
+          # Helper: read the real 'depends on' chain of CONFIG_KSU from the Kconfig files in this
+          # tree (it differs between KernelSU versions) and switch it all on.
+          cat > /tmp/ksu_deps.py <<'PY'
+          import os, re, subprocess, sys
+
+          def read(p):
+              try:
+                  return open(p, errors="ignore").read()
+              except Exception:
+                  return ""
+
+          BLOCK = re.compile(r"^(?:menu)?config\s+([A-Z0-9_]+)[ \t]*\n((?:[ \t]+.*\n|[ \t]*\n)*)", re.M)
+
+          def parse(txt, blocks):
+              for m in BLOCK.finditer(txt):
+                  deps = [l.strip()[len("depends on"):].strip()
+                          for l in m.group(2).splitlines() if l.strip().startswith("depends on")]
+                  blocks.setdefault(m.group(1), []).extend(deps)
+
+          blocks = {}
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in (".git", "out", "FinaSU", "KernelSU-Next", "Documentation")]
+              for f in files:
+                  if f.startswith("Kconfig"):
+                      parse(read(os.path.join(root, f)), blocks)
+          ksu = read("drivers/kernelsu/Kconfig")
+          if "config KSU" not in ksu:
+              sys.exit("drivers/kernelsu/Kconfig has no 'config KSU'")
+          m = re.search(r"^config KSU[ \t]*\n(.*?)(?=^\S)", ksu, re.S | re.M)
+          print("---- config KSU ----")
+          print("config KSU\n" + (m.group(1) if m else ""))
+          parse(ksu, blocks)
+
+          def terms(expr):
+              expr = re.sub(r"\s+if\s+.*$", "", expr)
+              for t in expr.split("&&"):
+                  t = t.strip().strip("()").strip()
+                  if t and "||" not in t and "=" not in t:
+                      yield t
+
+          enable, disable, seen = [], [], set()
+
+          def want(sym, depth=0):
+              if sym in seen or depth > 6:
+                  return
+              seen.add(sym)
+              enable.append(sym)
+              for expr in blocks.get(sym, []):
+                  for t in terms(expr):
+                      neg = t.startswith("!")
+                      s = t.lstrip("!").strip()
+                      if not re.fullmatch(r"[A-Z0-9_]+", s):
+                          continue
+                      if neg:
+                          disable.append(s)
+                      else:
+                          want(s, depth + 1)
+
+          want("KSU")
+          args = []
+          for s in reversed(enable):          # dependencies first, KSU last
+              args += ["-e", s]
+          for s in disable:
+              args += ["-d", s]
+          print("deps: enable", " ".join(reversed(enable)), "| disable", " ".join(disable) or "-")
+          subprocess.check_call(["scripts/config", "--file", "out/.config"] + args)
+          PY
           # FinaSU hooks via kprobes + the sys_enter tracepoint + a patched syscall table,
           # so these must be on BEFORE the SUSFS step, or KSU (and KSU_SUSFS) silently drop out.
           # Dependency chain on 4.14 (sweet_defconfig has none of it on):
@@ -442,37 +509,7 @@ jobs:
             for round in 1 2 3; do
               grep -q "^CONFIG_KSU=y" out/.config && break
               echo "---- KSU still off (round $round): resolving deps from drivers/kernelsu/Kconfig ----"
-              python3 - <<'PY'
-          import re, subprocess
-          txt = open("drivers/kernelsu/Kconfig").read()
-          m = re.search(r"^config KSU\n(.*?)(?=^\S)", txt, re.S | re.M)
-          if not m:
-              raise SystemExit("config KSU block not found in drivers/kernelsu/Kconfig")
-          block = m.group(1)
-          print(block)
-          args = []
-          for line in block.splitlines():
-              line = line.strip()
-              if not line.startswith("depends on"):
-                  continue
-              expr = re.sub(r"\s+if\s+.*$", "", line[len("depends on"):].strip())
-              for term in expr.split("&&"):
-                  term = term.strip().strip("()").strip()
-                  if not term:
-                      continue
-                  if "||" in term or "=" in term:
-                      print("deps: skipped complex term:", term)
-                      continue
-                  neg = term.startswith("!")
-                  sym = term.lstrip("!").strip()
-                  if not re.fullmatch(r"[A-Z0-9_]+", sym):
-                      print("deps: skipped:", term)
-                      continue
-                  args += ["-d" if neg else "-e", sym]
-                  print("deps:", "disable" if neg else "enable", sym)
-          if args:
-              subprocess.check_call(["scripts/config", "--file", "out/.config"] + args + ["-e", "KSU"])
-          PY
+              python3 /tmp/ksu_deps.py
               make O=out ARCH=arm64 olddefconfig
             done
             MISSING=""
@@ -489,6 +526,17 @@ jobs:
               for s in $MISSING; do grep -rn -A8 "^config $s\$" arch/Kconfig arch/arm64/Kconfig init/Kconfig kernel/trace/Kconfig lib/Kconfig.debug fs/Kconfig fs/overlayfs/Kconfig 2>/dev/null | head -14; done
               exit 1
             fi
+          fi
+          # KernelSU-Next: a newer upstream ref can bring new 'depends on' lines that make olddefconfig
+          # drop CONFIG_KSU (and with it KSU_SUSFS). Resolve them from the Kconfig instead of failing.
+          if [ "$VARIANT" = "kernelsu-next" ] && ! grep -q "^CONFIG_KSU=y" out/.config; then
+            echo "---- CONFIG_KSU is off after defconfig; resolving its dependencies ----"
+            for round in 1 2; do
+              python3 /tmp/ksu_deps.py
+              make O=out ARCH=arm64 olddefconfig
+              grep -q "^CONFIG_KSU=y" out/.config && break
+            done
+            grep -E "^CONFIG_(KSU|KPROBES|MODULES|OVERLAY_FS)=" out/.config || true
           fi
           # SUSFS: every SUSFS sub-option defaults to y once KSU_SUSFS is on (both variants)
           if [ -f fs/susfs.c ]; then
