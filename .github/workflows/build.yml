@@ -7,7 +7,7 @@ name: build
 # Root solution is selectable (Run workflow -> ksu_variant):
 #   kernelsu-next : KernelSU Next legacy + manual hooks (the in-tree KernelSU-Next/ dir) + SUSFS glue
 #   finasu        : LyraVoid/FinaSU, newest release tag fetched at build time (or a ref you type in)
-# A normal push to ksu-next always builds finasu.
+# A normal push to ksu-next always builds kernelsu-next (finasu does not compile on this 4.14 tree).
 #
 # Put this file at .github/workflows/build.yml in the ksu-next branch. Every push to
 # ksu-next starts a build. The manual "Run workflow" button only shows up if the file is
@@ -22,13 +22,17 @@ on:
         description: "Root solution to build in"
         type: choice
         options:
-          - finasu
           - kernelsu-next
-        default: finasu
+          - finasu
+        default: kernelsu-next
       finasu_ref:
         description: "FinaSU only: 'latest' = newest release tag, or type a tag/branch (e.g. v1.3.2, master)"
         type: string
         default: latest
+      ksun_ref:
+        description: "KernelSU-Next only: empty = use the copy already in the kernel tree; 'latest' = newest commit of upstream branch 'legacy'; or type a branch/tag/commit"
+        type: string
+        default: ""
       disable_lto:
         description: "Build WITHOUT LTO (faster; use to debug a failing/boot-looping build)"
         type: boolean
@@ -74,13 +78,41 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           IN_VARIANT: ${{ inputs.ksu_variant }}
           IN_FINASU_REF: ${{ inputs.finasu_ref }}
+          IN_KSUN_REF: ${{ inputs.ksun_ref }}
         run: |
           set -e
-          VARIANT="${IN_VARIANT:-finasu}"
+          VARIANT="${IN_VARIANT:-kernelsu-next}"
           case "$VARIANT" in
             kernelsu-next)
               echo "VARIANT_NAME=KernelSU Next" >> "$GITHUB_ENV"
               echo "SLUG=ksun" >> "$GITHUB_ENV"
+              KREF="${IN_KSUN_REF:-}"
+              if [ -n "$KREF" ]; then
+                # Replace the in-tree KernelSU-Next with a fresh upstream checkout (full history so
+                # the commit count, and therefore the version number, can be computed).
+                git clone --quiet https://github.com/KernelSU-Next/KernelSU-Next /tmp/ksun-up
+                echo "---- upstream branches ----"
+                git -C /tmp/ksun-up branch -r | head -20
+                [ "$KREF" = "latest" ] && KREF="origin/legacy"
+                git -C /tmp/ksun-up rev-parse -q --verify "${KREF}^{commit}" >/dev/null || { echo "::error::KernelSU-Next ref '$KREF' not found (see the branch list above)"; exit 1; }
+                git -C /tmp/ksun-up checkout -q "$KREF"
+                KCOUNT="$(git -C /tmp/ksun-up rev-list --count HEAD)"
+                KSHORT="$(git -C /tmp/ksun-up rev-parse --short HEAD)"
+                KTAG="$(git -C /tmp/ksun-up describe --tags --abbrev=0 2>/dev/null || echo "${KSU_TAG}")"
+                # same formula as the pinned KSU_VERSION: 30000 + commits + 289
+                KVER=$((30000 + KCOUNT + 289))
+                echo "Upstream KernelSU-Next: $KREF @ $KSHORT, $KCOUNT commits, tag $KTAG, version $KVER"
+                echo "(for reference, pinned 165b87f has $(git -C /tmp/ksun-up rev-list --count 165b87f 2>/dev/null || echo '?') commits here; expected 3027)"
+                test -f /tmp/ksun-up/kernel/Kconfig || { echo "::error::kernel/Kconfig missing in upstream ref $KREF"; exit 1; }
+                rm -rf KernelSU-Next
+                mv /tmp/ksun-up KernelSU-Next
+                rm -rf KernelSU-Next/.git
+                git add -A KernelSU-Next
+                git -c user.name=ci -c user.email=ci@localhost commit -q -m "ci: use upstream KernelSU-Next ${KSHORT}"
+                echo "KSUN_VERSION_USED=${KVER}" >> "$GITHUB_ENV"
+                echo "KSUN_TAG_USED=${KTAG}" >> "$GITHUB_ENV"
+                echo "KSUN_DESC=upstream ${KREF} @ ${KSHORT}" >> "$GITHUB_ENV"
+              fi
               ;;
             finasu)
               REF="${IN_FINASU_REF:-latest}"
@@ -480,7 +512,7 @@ jobs:
           # version overrides only exist for KernelSU-Next; FinaSU computes its own version
           EXTRA=()
           if [ "$VARIANT" = "kernelsu-next" ]; then
-            EXTRA=(KSU_VERSION_OVERRIDE="${KSU_VERSION}" KSU_VERSION_TAG_OVERRIDE="${KSU_TAG}")
+            EXTRA=(KSU_VERSION_OVERRIDE="${KSUN_VERSION_USED:-$KSU_VERSION}" KSU_VERSION_TAG_OVERRIDE="${KSUN_TAG_USED:-$KSU_TAG}")
           fi
           make -k -j"$(nproc)" O=out ARCH=arm64 \
             CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
@@ -585,7 +617,7 @@ jobs:
             if [ "$VARIANT" = "finasu" ]; then
               echo "Root: FinaSU ${FINASU_RESOLVED} (${FINASU_REPO}), ${SUS}"
             else
-              echo "Root: KernelSU Next (legacy, manual hooks), ${SUS}"
+              echo "Root: KernelSU Next (legacy, manual hooks), ${SUS}; source: ${KSUN_DESC:-copy in the kernel tree}"
             fi
             echo "Toolchain: AOSP Clang ${CLANG_ID}"
             echo "LTO disabled: ${{ inputs.disable_lto }}"
