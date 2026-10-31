@@ -367,16 +367,59 @@ jobs:
           if [ "$VARIANT" = "finasu" ]; then
             scripts/config --file out/.config \
               -e MODULES -e DEBUG_KERNEL -e KALLSYMS -e KALLSYMS_ALL \
-              -e KPROBES -e FTRACE -e FTRACE_SYSCALLS -e EXT4_FS -e KSU
+              -e KPROBES -e FTRACE -e FTRACE_SYSCALLS -e EXT4_FS -e OVERLAY_FS -e KSU
             make O=out ARCH=arm64 olddefconfig
+            # olddefconfig silently drops CONFIG_KSU when one of its 'depends on' symbols is off.
+            # Read the real dependencies from FinaSU's own Kconfig (they change between releases)
+            # and switch them on, instead of guessing the list by hand.
+            for round in 1 2 3; do
+              grep -q "^CONFIG_KSU=y" out/.config && break
+              echo "---- KSU still off (round $round): resolving deps from drivers/kernelsu/Kconfig ----"
+              python3 - <<'PY'
+          import re, subprocess
+          txt = open("drivers/kernelsu/Kconfig").read()
+          m = re.search(r"^config KSU\n(.*?)(?=^\S)", txt, re.S | re.M)
+          if not m:
+              raise SystemExit("config KSU block not found in drivers/kernelsu/Kconfig")
+          block = m.group(1)
+          print(block)
+          args = []
+          for line in block.splitlines():
+              line = line.strip()
+              if not line.startswith("depends on"):
+                  continue
+              expr = re.sub(r"\s+if\s+.*$", "", line[len("depends on"):].strip())
+              for term in expr.split("&&"):
+                  term = term.strip().strip("()").strip()
+                  if not term:
+                      continue
+                  if "||" in term or "=" in term:
+                      print("deps: skipped complex term:", term)
+                      continue
+                  neg = term.startswith("!")
+                  sym = term.lstrip("!").strip()
+                  if not re.fullmatch(r"[A-Z0-9_]+", sym):
+                      print("deps: skipped:", term)
+                      continue
+                  args += ["-d" if neg else "-e", sym]
+                  print("deps:", "disable" if neg else "enable", sym)
+          if args:
+              subprocess.check_call(["scripts/config", "--file", "out/.config"] + args + ["-e", "KSU"])
+          PY
+              make O=out ARCH=arm64 olddefconfig
+            done
             MISSING=""
-            for s in MODULES KPROBES KALLSYMS_ALL EXT4_FS FTRACE_SYSCALLS HAVE_SYSCALL_TRACEPOINTS THREAD_INFO_IN_TASK KSU; do
+            for s in MODULES KPROBES KALLSYMS_ALL EXT4_FS OVERLAY_FS FTRACE_SYSCALLS HAVE_SYSCALL_TRACEPOINTS THREAD_INFO_IN_TASK KSU; do
               if grep -q "^CONFIG_${s}=y" out/.config; then echo "  CONFIG_${s}=y"; else echo "  CONFIG_${s} NOT SET"; MISSING="$MISSING $s"; fi
             done
             if [ -n "$MISSING" ]; then
               echo "::error::FinaSU prerequisites missing after olddefconfig:$MISSING"
-              echo "---- why: Kconfig dependencies of the missing symbols ----"
-              for s in $MISSING; do grep -rn -A8 "^config $s\$" arch/Kconfig arch/arm64/Kconfig init/Kconfig kernel/trace/Kconfig lib/Kconfig.debug 2>/dev/null | head -14; done
+              echo "---- config KSU block as the kernel sees it ----"
+              sed -n '/^config KSU$/,/^config KSU_/p' drivers/kernelsu/Kconfig || true
+              echo "---- is the Kconfig sourced? ----"
+              grep -rn "kernelsu" drivers/Kconfig drivers/Makefile || true
+              echo "---- Kconfig dependencies of the missing symbols ----"
+              for s in $MISSING; do grep -rn -A8 "^config $s\$" arch/Kconfig arch/arm64/Kconfig init/Kconfig kernel/trace/Kconfig lib/Kconfig.debug fs/Kconfig fs/overlayfs/Kconfig 2>/dev/null | head -14; done
               exit 1
             fi
           fi
@@ -414,7 +457,7 @@ jobs:
             2>&1 | tee build.log
 
       - name: Show build errors
-        if: failure()
+        if: failure() && hashFiles('build.log') != ''
         run: |
           grep -nE "error:|\*\*\*|undefined reference|ld.lld:" build.log | head -40 || true
           echo "---- last 30 lines ----"
