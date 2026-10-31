@@ -31,6 +31,10 @@ on:
         description: "Build WITHOUT LTO (faster; use to debug a failing/boot-looping build)"
         type: boolean
         default: false
+      enable_susfs:
+        description: "EXPERIMENTAL: add SUSFS (simonpunk/susfs4ksu, branch kernel-4.14) on top of KernelSU, together with NoMount"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -43,6 +47,8 @@ env:
   CLANG_ID: r563880c
   KBUILD_BUILD_USER: PsychoAvy
   KBUILD_BUILD_HOST: github
+  # SUSFS is on for push builds; for manual runs it follows the enable_susfs input
+  ENABLE_SUSFS: ${{ github.event_name != 'workflow_dispatch' || inputs.enable_susfs }}
 
 jobs:
   build:
@@ -154,6 +160,39 @@ jobs:
           PY
           git --no-pager diff --stat -- fs/stat.c fs/Makefile || true
           grep -n -B3 -A3 "ksu_handle_newfstat_ret" fs/stat.c | head -30
+
+      # EXPERIMENTAL. SUSFS patches are written for tiann/KernelSU-style hooks; this tree uses
+      # backslashxx/KernelSU (scope-minimized hooks) + NoMount, so some hunks may not apply.
+      # If anything fails, the log lists the failing hunks (.rej files) so the patch can be adapted.
+      - name: Integrate SUSFS (experimental)
+        if: env.ENABLE_SUSFS == 'true'
+        run: |
+          set -e
+          git clone --quiet --depth=1 -b kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu /tmp/susfs
+          echo "SUSFS @ $(git -C /tmp/susfs rev-parse --short HEAD)"
+          echo "---- files in susfs4ksu (kernel-4.14) ----"
+          find /tmp/susfs -type f -not -path '*/.git/*' | sort | head -60
+          P=/tmp/susfs/kernel_patches
+          test -d "$P" || { echo "::error::kernel_patches/ not found in susfs4ksu kernel-4.14"; exit 1; }
+          KPATCH="$(ls "$P"/50_add_susfs_in_kernel-*.patch 2>/dev/null | head -1)"
+          SPATCH="$P/10_enable_susfs_for_ksu.patch"
+          test -n "$KPATCH" || { echo "::error::50_add_susfs_in_kernel-*.patch not found"; exit 1; }
+          test -f "$SPATCH" || { echo "::error::10_enable_susfs_for_ksu.patch not found"; exit 1; }
+          echo "kernel patch: $KPATCH"
+          cp -v "$P/fs/susfs.c" fs/
+          cp -v "$P"/include/linux/susfs*.h include/linux/
+          echo "---- 1/2: KernelSU side patch (dry run first) ----"
+          ( cd KernelSU && patch -p1 --dry-run < "$SPATCH" ) \
+            || { echo "::error::SUSFS KernelSU-side patch does not apply to backslashxx/KernelSU"; exit 1; }
+          ( cd KernelSU && patch -p1 --no-backup-if-mismatch < "$SPATCH" )
+          echo "---- 2/2: kernel side patch ----"
+          patch -p1 --no-backup-if-mismatch < "$KPATCH" || {
+            echo "::error::SUSFS kernel patch has failing hunks (see .rej files below)"
+            find . -name '*.rej' -not -path './out/*' | head -20
+            for f in $(find . -name '*.rej' -not -path './out/*' | head -5); do echo "=== $f ==="; cat "$f"; done
+            exit 1
+          }
+          echo "SUSFS_DESC=simonpunk/susfs4ksu kernel-4.14 @ $(git -C /tmp/susfs rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         run: |
@@ -285,6 +324,12 @@ jobs:
           fi
           grep -E "^CONFIG_NOMOUNT" out/.config || true
           grep -q "^CONFIG_NOMOUNT=y" out/.config || { echo "::error::CONFIG_NOMOUNT=y is not set in the final config"; sed -n '1,60p' fs/nomount/Kconfig 2>/dev/null || true; exit 1; }
+          if [ "$ENABLE_SUSFS" = "true" ]; then
+            scripts/config --file out/.config -e KSU_SUSFS
+            make O=out ARCH=arm64 olddefconfig
+            grep -E "^CONFIG_KSU_SUSFS" out/.config || true
+            grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "::error::CONFIG_KSU_SUSFS=y is not set in the final config (symbol missing from KernelSU Kconfig?)"; exit 1; }
+          fi
           if [ "${{ inputs.disable_lto }}" = "true" ]; then
             scripts/config --file out/.config -d LTO_CLANG -d THINLTO -e LTO_NONE
             make O=out ARCH=arm64 olddefconfig
@@ -337,6 +382,13 @@ jobs:
             echo "::error::No NoMount strings found in the kernel image"; exit 1
           fi
           echo "NoMount strings found in Image: $NMC"
+          if [ "$ENABLE_SUSFS" = "true" ]; then
+            SUC="$(strings -n 6 out/arch/arm64/boot/Image | grep -ci "susfs" || true)"
+            if [ "${SUC:-0}" -eq 0 ]; then
+              echo "::error::No SUSFS strings found in the kernel image"; exit 1
+            fi
+            echo "SUSFS strings found in Image: $SUC"
+          fi
 
       - name: Package AnyKernel3 zip
         id: pack
@@ -397,6 +449,9 @@ jobs:
             echo
             echo "- 🔑 **Root:** ${VARIANT_NAME}"
             echo "- 📁 **NoMount:** built in (install the NoMount module after flashing)"
+            if [ "$ENABLE_SUSFS" = "true" ]; then
+              echo "- 👻 **SUSFS:** built in (install the SUSFS module after flashing)"
+            fi
             echo "- ⚙️ **Clang ${CLANG_ID}** · LTO ${LTO}"
             echo "- 🔖 **Commit:** ${{ steps.pack.outputs.short }}"
             echo "- 🧬 **Base:** Spiteful kernel (stock DerpFest kernel) · [source](https://github.com/tbyool/android_kernel_xiaomi_sm6150)"
