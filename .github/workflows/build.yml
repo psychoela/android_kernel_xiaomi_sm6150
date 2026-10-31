@@ -94,6 +94,8 @@ jobs:
               fi
               echo "FinaSU ref: $REF"
               git clone --branch "$REF" "https://github.com/${FINASU_REPO}" FinaSU
+              echo "---- newest FinaSU tags (type one into finasu_ref to try it) ----"
+              git ls-remote --tags --refs --sort=-v:refname "https://github.com/${FINASU_REPO}" | sed 's|.*refs/tags/||' | head -15 || true
               test -f FinaSU/kernel/Kconfig || { echo "::error::FinaSU/kernel/Kconfig not found (ref $REF)"; exit 1; }
               # point drivers/kernelsu at FinaSU instead of KernelSU-Next
               rm -rf drivers/kernelsu
@@ -355,6 +357,39 @@ jobs:
           PY
           grep -n -B2 -A2 ksu_handle_newfstat_ret fs/stat.c || true
           git status --short | head -40
+
+      # FinaSU is written for newer kernels. This only reports how many newer-kernel APIs the chosen
+      # FinaSU ref uses (warning, never fails), so a hopeless ref is obvious from the log.
+      - name: FinaSU compatibility probe (kernel 4.14)
+        if: env.VARIANT == 'finasu'
+        run: |
+          TOTAL=0
+          for m in selinux_policy TWA_RESUME remap_file_range handle_inode_event copy_to_kernel_nofault copy_from_user_nofault alloc_file_pseudo filename_trans_key; do
+            N="$(grep -RIl "$m" drivers/kernelsu/ 2>/dev/null | wc -l)"
+            echo "  $m: used in $N file(s)"
+            TOTAL=$((TOTAL + N))
+          done
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "::warning::FinaSU ${FINASU_RESOLVED} uses APIs missing from 4.14 ($TOTAL hits); expect compile errors. Try an older finasu_ref."
+          else
+            echo "No known newer-kernel APIs found in FinaSU ${FINASU_RESOLVED}"
+          fi
+
+      # FinaSU needs FTRACE_SYSCALLS, which turns tracing on. That compiles the msm-4.14 sched trace
+      # events, which reference fields that do not exist in this tree (cpu_load[], util_est.*).
+      # Patch only the failing expressions (see build log: sched.h:169, 1421, 1422, 1452).
+      - name: Fix sched trace events for tracing builds (FinaSU only)
+        if: env.VARIANT == 'finasu'
+        run: |
+          F=include/trace/events/sched.h
+          sed -i \
+            -e 's/task_rq(p)->cpu_load\[0\]/0/' \
+            -e 's/avg->util_est\.enqueued/avg->util_est/' \
+            -e 's/avg->util_est\.ewma/0/' \
+            -e 's/cfs_rq->avg\.util_est\.enqueued/cfs_rq->avg.util_est/' \
+            "$F"
+          git diff --stat -- "$F" || true
+          grep -nE "cpu_load|util_est" "$F" | head -20 || true
 
       - name: Configure kernel
         run: |
