@@ -105,6 +105,56 @@ jobs:
           cat fs/nomount/Kconfig 2>/dev/null | head -40 || true
           echo "NM_DESC=maxsteeel/nomount branch ${NM_REF}" >> "$GITHUB_ENV"
 
+      # The kernel tree was prepared for KernelSU-Next (legacy). backslashxx/KernelSU uses the
+      # "scope-minimized manual hooks" layout (backslashxx/KernelSU#5), which differs in two places:
+      #  1. fs/read_write.c still calls ksu_vfs_read_hook / ksu_handle_sys_read, which the fork does not
+      #     provide (init.rc is handled through an LSM hook instead). Define them as inert stubs so the
+      #     link succeeds; the flag stays false, so the old read hook never runs.
+      #  2. fs/stat.c needs the newfstat return hook, otherwise init never sees the enlarged init.rc
+      #     (required on Android 16+, harmless on older).
+      - name: Adapt manual hooks for backslashxx/KernelSU
+        run: |
+          set -e
+          cat > fs/ksu_hook_stubs.c <<'EOF'
+          // SPDX-License-Identifier: GPL-2.0
+          /* Inert stubs for the old KernelSU-Next read hook still referenced by fs/read_write.c. */
+          #include <linux/types.h>
+          #include <linux/compiler.h>
+          #include <linux/cache.h>
+          #include <linux/uaccess.h>
+
+          bool ksu_vfs_read_hook __read_mostly = false;
+
+          int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr)
+          {
+          	return 0;
+          }
+          EOF
+          grep -q "ksu_hook_stubs" fs/Makefile || echo 'obj-$(CONFIG_KSU) += ksu_hook_stubs.o' >> fs/Makefile
+          python3 - <<'PY'
+          import re, sys, pathlib
+          p = pathlib.Path("fs/stat.c")
+          text = p.read_text()
+          if "ksu_handle_newfstat_ret" in text:
+              print("fs/stat.c: newfstat hook already present")
+              sys.exit(0)
+          m = re.search(r"^SYSCALL_DEFINE2\(newfstat,.*?^\}\n", text, re.S | re.M)
+          if not m:
+              sys.exit("SYSCALL_DEFINE2(newfstat) not found in fs/stat.c")
+          body = m.group(0)
+          if "\treturn error;\n}" not in body:
+              sys.exit("unexpected newfstat body:\n" + body)
+          new = body.replace("\treturn error;\n}",
+              "#if defined(CONFIG_KSU) && !defined(CONFIG_KSU_KPROBES_KSUD)\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif\n\treturn error;\n}", 1)
+          decl = ("#if defined(CONFIG_KSU) && !defined(CONFIG_KSU_KPROBES_KSUD)\n"
+                  "extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);\n"
+                  "#endif\n\n")
+          p.write_text(text[:m.start()] + decl + new + text[m.end():])
+          print("fs/stat.c: newfstat hook added")
+          PY
+          git --no-pager diff --stat -- fs/stat.c fs/Makefile || true
+          grep -n -B3 -A3 "ksu_handle_newfstat_ret" fs/stat.c | head -30
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
