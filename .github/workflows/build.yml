@@ -196,6 +196,8 @@ jobs:
       - name: Configure kernel
         run: |
           make O=out ARCH=arm64 "$DEFCONFIG"
+          # Kernel name shown in Settings / KernelSU: 4.14.357-Spiteful-Sweet/KSU-r1.0
+          scripts/config --file out/.config --set-str LOCALVERSION "-Spiteful-Sweet/KSU-r1.0" -d LOCALVERSION_AUTO
           # Helper: read the real 'depends on' chain of a config symbol (default KSU, or NOMOUNT) from the
           # Kconfig files in this tree and switch it all on.
           cat > /tmp/ksu_deps.py <<'PY'
@@ -349,7 +351,7 @@ jobs:
           cat > AnyKernel3/anykernel.sh <<'EOF'
           # AnyKernel3 Ramdisk Mod Script
           properties() { '
-          kernel.string=Spiteful (@VARIANT_NAME@) for sweet by PsychoAvy
+          kernel.string=Spiteful-Sweet/KSU-r1.0 (@VARIANT_NAME@) for sweet by PsychoAvy
           do.devicecheck=1
           do.modules=0
           do.systemless=0
@@ -387,16 +389,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="sweet-${SLUG}-run${{ github.run_number }}"
+          if [ "${{ inputs.disable_lto }}" = "true" ]; then LTO="off"; else LTO="on"; fi
           {
-            echo "Kernel: ${{ steps.verify.outputs.krel }}"
-            echo "Source: ${{ github.repository }}@${{ steps.pack.outputs.short }} (branch ${{ github.ref_name }})"
-            echo "Root: ${KSU_DESC}, manual hooks, no SUSFS"
-            echo "NoMount: ${NM_DESC} (kernel side). Install the matching NoMount metamodule after flashing."
-            echo "Toolchain: AOSP Clang ${CLANG_ID}"
-            echo "LTO disabled: ${{ inputs.disable_lto }}"
+            echo "### 🦉 Spiteful-Sweet/KSU-r1.0"
             echo
-            echo "Flash in recovery. Back up boot first."
+            echo "\`${{ steps.verify.outputs.krel }}\`"
+            echo
+            echo "- 🔑 **Root:** ${VARIANT_NAME}"
+            echo "- 📁 **NoMount:** built in (install the NoMount module after flashing)"
+            echo "- ⚙️ **Clang ${CLANG_ID}** · LTO ${LTO}"
+            echo "- 🔖 **Commit:** ${{ steps.pack.outputs.short }}"
+            echo "- 🧬 **Base:** Spiteful kernel (stock DerpFest kernel) · [source](https://github.com/tbyool/android_kernel_xiaomi_sm6150)"
+            echo
+            echo "> Flash in recovery. Back up boot first."
           } > notes.txt
           gh release create "$TAG" "${{ steps.pack.outputs.zip }}" \
-            --title "sweet ${SLUG^^} ${{ steps.pack.outputs.short }} (run ${{ github.run_number }})" \
+            --title "Spiteful-Sweet r1.0 · run ${{ github.run_number }}" \
             --notes-file notes.txt
