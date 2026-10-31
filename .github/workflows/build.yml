@@ -7,7 +7,7 @@ name: build
 # Root solution is selectable (Run workflow -> ksu_variant):
 #   kernelsu-next : KernelSU Next legacy + manual hooks (the in-tree KernelSU-Next/ dir) + SUSFS glue
 #   finasu        : LyraVoid/FinaSU, newest release tag fetched at build time (or a ref you type in)
-# A normal push to ksu-next always builds kernelsu-next.
+# A normal push to ksu-next always builds finasu.
 #
 # Put this file at .github/workflows/build.yml in the ksu-next branch. Every push to
 # ksu-next starts a build. The manual "Run workflow" button only shows up if the file is
@@ -22,9 +22,9 @@ on:
         description: "Root solution to build in"
         type: choice
         options:
-          - kernelsu-next
           - finasu
-        default: kernelsu-next
+          - kernelsu-next
+        default: finasu
       finasu_ref:
         description: "FinaSU only: 'latest' = newest release tag, or type a tag/branch (e.g. v1.3.2, master)"
         type: string
@@ -76,7 +76,7 @@ jobs:
           IN_FINASU_REF: ${{ inputs.finasu_ref }}
         run: |
           set -e
-          VARIANT="${IN_VARIANT:-kernelsu-next}"
+          VARIANT="${IN_VARIANT:-finasu}"
           case "$VARIANT" in
             kernelsu-next)
               echo "VARIANT_NAME=KernelSU Next" >> "$GITHUB_ENV"
