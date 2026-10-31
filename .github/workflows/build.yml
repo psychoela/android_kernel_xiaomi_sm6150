@@ -175,12 +175,12 @@ jobs:
           P=/tmp/susfs/kernel_patches
           test -d "$P" || { echo "::error::kernel_patches/ not found in susfs4ksu kernel-4.14"; exit 1; }
           KPATCH="$(ls "$P"/50_add_susfs_in_kernel-*.patch 2>/dev/null | head -1)"
-          SPATCH="$P/10_enable_susfs_for_ksu.patch"
+          SPATCH="$P/KernelSU/10_enable_susfs_for_ksu.patch"
           test -n "$KPATCH" || { echo "::error::50_add_susfs_in_kernel-*.patch not found"; exit 1; }
           test -f "$SPATCH" || { echo "::error::10_enable_susfs_for_ksu.patch not found"; exit 1; }
           echo "kernel patch: $KPATCH"
-          cp -v "$P/fs/susfs.c" fs/
-          cp -v "$P"/include/linux/susfs*.h include/linux/
+          cp -v "$P"/fs/*.c fs/
+          cp -v "$P"/include/linux/*.h include/linux/
           echo "---- 1/2: KernelSU side patch (dry run first) ----"
           ( cd KernelSU && patch -p1 --dry-run < "$SPATCH" ) \
             || { echo "::error::SUSFS KernelSU-side patch does not apply to backslashxx/KernelSU"; exit 1; }
