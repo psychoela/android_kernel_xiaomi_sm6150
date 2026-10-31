@@ -1,9 +1,13 @@
 name: build
 
-# Builds tbyool/android_kernel_xiaomi_sm6150 (branch ksu-next, KernelSU Next legacy +
-# manual hooks) for Redmi Note 10 Pro (sweet/sweetin) and publishes an AnyKernel3 zip
-# as a GitHub Release. Nothing is uploaded as an Actions artifact (avoids the artifact
-# storage quota problem).
+# Builds tbyool/android_kernel_xiaomi_sm6150 (branch ksu-next) for Redmi Note 10 Pro
+# (sweet/sweetin) and publishes an AnyKernel3 zip as a GitHub Release. Nothing is
+# uploaded as an Actions artifact (avoids the artifact storage quota problem).
+#
+# Root solution is selectable (Run workflow -> ksu_variant):
+#   kernelsu-next : KernelSU Next legacy + manual hooks (the in-tree KernelSU-Next/ dir) + SUSFS glue
+#   finasu        : LyraVoid/FinaSU, newest release tag fetched at build time (or a ref you type in)
+# A normal push to ksu-next always builds kernelsu-next.
 #
 # Put this file at .github/workflows/build.yml in the ksu-next branch. Every push to
 # ksu-next starts a build. The manual "Run workflow" button only shows up if the file is
@@ -14,6 +18,17 @@ on:
     branches: [ksu-next]
   workflow_dispatch:
     inputs:
+      ksu_variant:
+        description: "Root solution to build in"
+        type: choice
+        options:
+          - kernelsu-next
+          - finasu
+        default: kernelsu-next
+      finasu_ref:
+        description: "FinaSU only: 'latest' = newest release tag, or type a tag/branch (e.g. v1.3.2, master)"
+        type: string
+        default: latest
       disable_lto:
         description: "Build WITHOUT LTO (faster; use to debug a failing/boot-looping build)"
         type: boolean
@@ -31,9 +46,11 @@ env:
   # KernelSU-Next "legacy" branch @165b87f (v3.4.0-legacy + fixes), ksuver = 30000 + 3027 commits + 289
   KSU_VERSION: "33316"
   KSU_TAG: "v3.4.0-legacy"
+  # FinaSU source
+  FINASU_REPO: LyraVoid/FinaSU
   # SUSFS 2.3.0: core (fs/susfs.c + kernel hooks) is cherry-picked from tbyool/android_kernel_xiaomi_sm6150
   # (commit "treewide: Import SUSFS 2.3.0"); the KernelSU-Next side is wired in by the glue script below.
-  # Set to "false" to build without SUSFS.
+  # Only used for the kernelsu-next variant. Set to "false" to build without SUSFS.
   SUSFS_PATCH: "true"
   SUSFS_CORE_COMMIT: 412885cb8318
   KBUILD_BUILD_USER: PsychoAvy
@@ -51,6 +68,47 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
+      - name: Select root variant
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_VARIANT: ${{ inputs.ksu_variant }}
+          IN_FINASU_REF: ${{ inputs.finasu_ref }}
+        run: |
+          set -e
+          VARIANT="${IN_VARIANT:-kernelsu-next}"
+          case "$VARIANT" in
+            kernelsu-next)
+              echo "VARIANT_NAME=KernelSU Next" >> "$GITHUB_ENV"
+              echo "SLUG=ksun" >> "$GITHUB_ENV"
+              ;;
+            finasu)
+              REF="${IN_FINASU_REF:-latest}"
+              if [ "$REF" = "latest" ]; then
+                # newest published release; fall back to newest tag, then master
+                REF="$(gh api "repos/${FINASU_REPO}/releases/latest" --jq .tag_name 2>/dev/null || true)"
+                if [ -z "$REF" ]; then
+                  REF="$(git ls-remote --tags --refs --sort=-v:refname "https://github.com/${FINASU_REPO}" | head -1 | sed 's|.*refs/tags/||')"
+                fi
+                REF="${REF:-master}"
+              fi
+              echo "FinaSU ref: $REF"
+              git clone --branch "$REF" "https://github.com/${FINASU_REPO}" FinaSU
+              test -f FinaSU/kernel/Kconfig || { echo "::error::FinaSU/kernel/Kconfig not found (ref $REF)"; exit 1; }
+              # point drivers/kernelsu at FinaSU instead of KernelSU-Next
+              rm -rf drivers/kernelsu
+              ln -s ../FinaSU/kernel drivers/kernelsu
+              ls -la drivers/kernelsu
+              FSHORT="$(git -C FinaSU rev-parse --short HEAD)"
+              echo "VARIANT_NAME=FinaSU ${REF}" >> "$GITHUB_ENV"
+              echo "SLUG=finasu" >> "$GITHUB_ENV"
+              echo "FINASU_RESOLVED=${REF} (${FSHORT})" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "::error::Unknown ksu_variant: $VARIANT"; exit 1
+              ;;
+          esac
+          echo "VARIANT=$VARIANT" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         run: |
@@ -77,14 +135,16 @@ jobs:
 
       - name: Show toolchain and KernelSU Kconfig
         run: |
+          echo "Variant: $VARIANT ($VARIANT_NAME)"
           echo "$GITHUB_WORKSPACE/clang/bin" >> "$GITHUB_PATH"
           "$GITHUB_WORKSPACE/clang/bin/clang" --version | head -2
-          ls drivers/kernelsu >/dev/null && echo "drivers/kernelsu present"
-          grep -rn "^config KSU" KernelSU-Next/kernel/Kconfig || true
+          ls -la drivers/kernelsu
+          ls drivers/kernelsu/ >/dev/null && echo "drivers/kernelsu present"
+          grep -rn "^config KSU" drivers/kernelsu/Kconfig || true
           grep -rIl "ksu_handle" fs kernel drivers/input 2>/dev/null | head
 
       - name: Add SUSFS 2.3.0 (tbyool core + KernelSU-Next glue)
-        if: env.SUSFS_PATCH == 'true'
+        if: env.SUSFS_PATCH == 'true' && env.VARIANT == 'kernelsu-next'
         run: |
           set -e
           git config user.name "ci"
@@ -289,14 +349,21 @@ jobs:
         run: |
           make O=out ARCH=arm64 "$DEFCONFIG"
           # SUSFS: Kconfig defaults enable every SUSFS option once KSU_SUSFS is on (see glue script)
-          if [ -f fs/susfs.c ]; then
+          if [ "$VARIANT" = "kernelsu-next" ] && [ -f fs/susfs.c ]; then
             echo "SUSFS found in source tree, enabling"
             scripts/config --file out/.config -e KSU_SUSFS
             make O=out ARCH=arm64 olddefconfig
             grep "^CONFIG_KSU_SUSFS" out/.config
             grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "::error::CONFIG_KSU_SUSFS=y is not set in the final config"; exit 1; }
           else
-            echo "::warning::No fs/susfs.c in source tree, building WITHOUT SUSFS"
+            echo "::warning::Building WITHOUT the SUSFS glue (variant: $VARIANT)"
+          fi
+          # FinaSU hooks via kprobes + the sys_enter tracepoint + a patched syscall table
+          # (no manual hooks), so these must be on or KSU silently drops out of the config.
+          if [ "$VARIANT" = "finasu" ]; then
+            scripts/config --file out/.config -e KPROBES -e FTRACE_SYSCALLS -e KSU
+            make O=out ARCH=arm64 olddefconfig
+            grep -E "^CONFIG_(KPROBES|FTRACE_SYSCALLS|HAVE_SYSCALL_TRACEPOINTS|EXT4_FS|KSU)=" out/.config || true
           fi
           if [ "${{ inputs.disable_lto }}" = "true" ]; then
             scripts/config --file out/.config -d LTO_CLANG -d THINLTO -e LTO_NONE
@@ -307,14 +374,18 @@ jobs:
 
       - name: Build kernel
         run: |
+          # version overrides only exist for KernelSU-Next; FinaSU computes its own version
+          EXTRA=()
+          if [ "$VARIANT" = "kernelsu-next" ]; then
+            EXTRA=(KSU_VERSION_OVERRIDE="${KSU_VERSION}" KSU_VERSION_TAG_OVERRIDE="${KSU_TAG}")
+          fi
           make -k -j"$(nproc)" O=out ARCH=arm64 \
             CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
-            KSU_VERSION_OVERRIDE="${KSU_VERSION}" \
-            KSU_VERSION_TAG_OVERRIDE="${KSU_TAG}" \
+            "${EXTRA[@]}" \
             2>&1 | tee build.log
 
       - name: Show build errors
@@ -341,12 +412,12 @@ jobs:
           echo "Kernel release: $KREL"
           echo "Image: $KIMG"
           ls -la "$BOOT"
-          # KernelSU must really be compiled in
-          COUNT="$(strings -n 8 out/arch/arm64/boot/Image | grep -c "KernelSU" || true)"
+          # The root solution must really be compiled in
+          COUNT="$(strings -n 8 out/arch/arm64/boot/Image | grep -ciE "KernelSU|FinaSU" || true)"
           if [ "${COUNT:-0}" -eq 0 ]; then
-            echo "::error::No KernelSU strings found in the kernel image"; exit 1
+            echo "::error::No KernelSU/FinaSU strings found in the kernel image"; exit 1
           fi
-          echo "KernelSU strings found in Image: $COUNT"
+          echo "KernelSU/FinaSU strings found in Image: $COUNT"
           SUSFS_COUNT="$(strings -n 6 out/arch/arm64/boot/Image | grep -ci "susfs" || true)"
           if [ -f fs/susfs.c ] && [ "${SUSFS_COUNT:-0}" -eq 0 ]; then
             echo "::error::fs/susfs.c exists but no SUSFS strings found in the kernel image"; exit 1
@@ -366,7 +437,7 @@ jobs:
           cat > AnyKernel3/anykernel.sh <<'EOF'
           # AnyKernel3 Ramdisk Mod Script
           properties() { '
-          kernel.string=Spiteful (KernelSU Next) for sweet by PsychoAvy
+          kernel.string=Spiteful (@VARIANT_NAME@) for sweet by PsychoAvy
           do.devicecheck=1
           do.modules=0
           do.systemless=0
@@ -389,10 +460,11 @@ jobs:
           dump_boot;
           write_boot;
           EOF
+          sed -i "s|@VARIANT_NAME@|${VARIANT_NAME}|" AnyKernel3/anykernel.sh
           KIMG="${{ steps.verify.outputs.kimg }}"
           cp "$KIMG" "AnyKernel3/$(basename "$KIMG")"
           SHORT="$(git rev-parse --short HEAD)"
-          ZIP="sweet-ksun-${SHORT}-run${{ github.run_number }}.zip"
+          ZIP="sweet-${SLUG}-${SHORT}-run${{ github.run_number }}.zip"
           (cd AnyKernel3 && zip -r9 "../$ZIP" . -x '.git*')
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
           echo "short=$SHORT" >> "$GITHUB_OUTPUT"
@@ -402,18 +474,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="sweet-ksun-run${{ github.run_number }}"
+          TAG="sweet-${SLUG}-run${{ github.run_number }}"
           {
             echo "Kernel: ${{ steps.verify.outputs.krel }}"
             echo "Source: ${{ github.repository }}@${{ steps.pack.outputs.short }} (branch ${{ github.ref_name }})"
             if [ -f fs/susfs.c ]; then SUS="SUSFS"; else SUS="no SUSFS"; fi
-            echo "Root: KernelSU Next (legacy, manual hooks), ${SUS}"
+            if [ "$VARIANT" = "finasu" ]; then
+              echo "Root: FinaSU ${FINASU_RESOLVED} (${FINASU_REPO}), ${SUS}"
+            else
+              echo "Root: KernelSU Next (legacy, manual hooks), ${SUS}"
+            fi
             echo "Toolchain: AOSP Clang ${CLANG_ID}"
             echo "LTO disabled: ${{ inputs.disable_lto }}"
             echo
             echo "Flash in recovery. Back up boot first."
           } > notes.txt
           gh release create "$TAG" "${{ steps.pack.outputs.zip }}" \
-            --title "sweet KSUN ${{ steps.pack.outputs.short }} (run ${{ github.run_number }})" \
+            --title "sweet ${SLUG^^} ${{ steps.pack.outputs.short }} (run ${{ github.run_number }})" \
             --notes-file notes.txt
-            
