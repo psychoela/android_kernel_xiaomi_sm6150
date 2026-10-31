@@ -50,7 +50,7 @@ env:
   FINASU_REPO: LyraVoid/FinaSU
   # SUSFS 2.3.0: core (fs/susfs.c + kernel hooks) is cherry-picked from tbyool/android_kernel_xiaomi_sm6150
   # (commit "treewide: Import SUSFS 2.3.0"); the KernelSU-Next side is wired in by the glue script below.
-  # Only used for the kernelsu-next variant. Set to "false" to build without SUSFS.
+  # Core is used by both variants (FinaSU brings its own KernelSU-side glue). Set to "false" to build without SUSFS.
   SUSFS_PATCH: "true"
   SUSFS_CORE_COMMIT: 412885cb8318
   KBUILD_BUILD_USER: PsychoAvy
@@ -141,10 +141,14 @@ jobs:
           ls -la drivers/kernelsu
           ls drivers/kernelsu/ >/dev/null && echo "drivers/kernelsu present"
           grep -rn "^config KSU" drivers/kernelsu/Kconfig || true
-          grep -rIl "ksu_handle" fs kernel drivers/input 2>/dev/null | head
+          # diagnostic only: grep exits 1 when nothing matches, which pipefail turns into a failed step
+          grep -rIl "ksu_handle" fs kernel drivers/input 2>/dev/null | head || true
 
+      # Core SUSFS (fs/susfs.c + kernel hooks) is needed by both variants. The KernelSU-Next glue
+      # below only runs for kernelsu-next: FinaSU ships its own SUSFS glue (kernel/extension/susfs.c,
+      # built when CONFIG_KSU_SUSFS=y) and expects only the SUSFS kernel side to be present.
       - name: Add SUSFS 2.3.0 (tbyool core + KernelSU-Next glue)
-        if: env.SUSFS_PATCH == 'true' && env.VARIANT == 'kernelsu-next'
+        if: env.SUSFS_PATCH == 'true'
         run: |
           set -e
           git config user.name "ci"
@@ -164,11 +168,15 @@ jobs:
           test -f fs/susfs.c
           grep -n "susfs" fs/Makefile
           python3 - <<'PY'
-          import re, pathlib, sys
+          import os, re, pathlib, sys
 
           K = pathlib.Path("KernelSU-Next/kernel")
+          FINASU = os.environ.get("VARIANT") == "finasu"
 
           def edit(rel, fn):
+              if FINASU:
+                  print("glue: skip (FinaSU has its own SUSFS glue):", rel)
+                  return
               p = K / rel
               s = p.read_text()
               n = fn(s)
@@ -334,36 +342,96 @@ jobs:
                       "struct stat __user **statbuf_ptr);\n#endif\n\n")
               return text[:m.start()] + decl + new + text[m.end():], "newfstat hook added"
 
-          _p = ROOT / "fs/stat.c"
-          _new, _msg = stat_hook(_p.read_text())
-          if _new != _p.read_text():
-              _p.write_text(_new)
-          print("glue: fs/stat.c", _msg)
+          if FINASU:
+              print("glue: fs/stat.c newfstat hook skipped (FinaSU)")
+          else:
+              _p = ROOT / "fs/stat.c"
+              _new, _msg = stat_hook(_p.read_text())
+              if _new != _p.read_text():
+                  _p.write_text(_new)
+              print("glue: fs/stat.c", _msg)
 
           print("glue: done")
           PY
-          grep -n -B2 -A2 ksu_handle_newfstat_ret fs/stat.c
+          grep -n -B2 -A2 ksu_handle_newfstat_ret fs/stat.c || true
           git status --short | head -40
 
       - name: Configure kernel
         run: |
           make O=out ARCH=arm64 "$DEFCONFIG"
-          # SUSFS: Kconfig defaults enable every SUSFS option once KSU_SUSFS is on (see glue script)
-          if [ "$VARIANT" = "kernelsu-next" ] && [ -f fs/susfs.c ]; then
+          # FinaSU hooks via kprobes + the sys_enter tracepoint + a patched syscall table,
+          # so these must be on BEFORE the SUSFS step, or KSU (and KSU_SUSFS) silently drop out.
+          # Dependency chain on 4.14 (sweet_defconfig has none of it on):
+          #   KSU -> KPROBES + EXT4_FS ; KPROBES -> MODULES + HAVE_KPROBES ; KALLSYMS_ALL -> DEBUG_KERNEL + KALLSYMS
+          #   FTRACE_SYSCALLS -> FTRACE (turns on the syscall tracepoints FinaSU's sys_enter hook needs)
+          if [ "$VARIANT" = "finasu" ]; then
+            scripts/config --file out/.config \
+              -e MODULES -e DEBUG_KERNEL -e KALLSYMS -e KALLSYMS_ALL \
+              -e KPROBES -e FTRACE -e FTRACE_SYSCALLS -e EXT4_FS -e OVERLAY_FS -e KSU
+            make O=out ARCH=arm64 olddefconfig
+            # olddefconfig silently drops CONFIG_KSU when one of its 'depends on' symbols is off.
+            # Read the real dependencies from FinaSU's own Kconfig (they change between releases)
+            # and switch them on, instead of guessing the list by hand.
+            for round in 1 2 3; do
+              grep -q "^CONFIG_KSU=y" out/.config && break
+              echo "---- KSU still off (round $round): resolving deps from drivers/kernelsu/Kconfig ----"
+              python3 - <<'PY'
+          import re, subprocess
+          txt = open("drivers/kernelsu/Kconfig").read()
+          m = re.search(r"^config KSU\n(.*?)(?=^\S)", txt, re.S | re.M)
+          if not m:
+              raise SystemExit("config KSU block not found in drivers/kernelsu/Kconfig")
+          block = m.group(1)
+          print(block)
+          args = []
+          for line in block.splitlines():
+              line = line.strip()
+              if not line.startswith("depends on"):
+                  continue
+              expr = re.sub(r"\s+if\s+.*$", "", line[len("depends on"):].strip())
+              for term in expr.split("&&"):
+                  term = term.strip().strip("()").strip()
+                  if not term:
+                      continue
+                  if "||" in term or "=" in term:
+                      print("deps: skipped complex term:", term)
+                      continue
+                  neg = term.startswith("!")
+                  sym = term.lstrip("!").strip()
+                  if not re.fullmatch(r"[A-Z0-9_]+", sym):
+                      print("deps: skipped:", term)
+                      continue
+                  args += ["-d" if neg else "-e", sym]
+                  print("deps:", "disable" if neg else "enable", sym)
+          if args:
+              subprocess.check_call(["scripts/config", "--file", "out/.config"] + args + ["-e", "KSU"])
+          PY
+              make O=out ARCH=arm64 olddefconfig
+            done
+            MISSING=""
+            for s in MODULES KPROBES KALLSYMS_ALL EXT4_FS OVERLAY_FS FTRACE_SYSCALLS HAVE_SYSCALL_TRACEPOINTS THREAD_INFO_IN_TASK KSU; do
+              if grep -q "^CONFIG_${s}=y" out/.config; then echo "  CONFIG_${s}=y"; else echo "  CONFIG_${s} NOT SET"; MISSING="$MISSING $s"; fi
+            done
+            if [ -n "$MISSING" ]; then
+              echo "::error::FinaSU prerequisites missing after olddefconfig:$MISSING"
+              echo "---- config KSU block as the kernel sees it ----"
+              sed -n '/^config KSU$/,/^config KSU_/p' drivers/kernelsu/Kconfig || true
+              echo "---- is the Kconfig sourced? ----"
+              grep -rn "kernelsu" drivers/Kconfig drivers/Makefile || true
+              echo "---- Kconfig dependencies of the missing symbols ----"
+              for s in $MISSING; do grep -rn -A8 "^config $s\$" arch/Kconfig arch/arm64/Kconfig init/Kconfig kernel/trace/Kconfig lib/Kconfig.debug fs/Kconfig fs/overlayfs/Kconfig 2>/dev/null | head -14; done
+              exit 1
+            fi
+          fi
+          # SUSFS: every SUSFS sub-option defaults to y once KSU_SUSFS is on (both variants)
+          if [ -f fs/susfs.c ]; then
             echo "SUSFS found in source tree, enabling"
             scripts/config --file out/.config -e KSU_SUSFS
             make O=out ARCH=arm64 olddefconfig
-            grep "^CONFIG_KSU_SUSFS" out/.config
-            grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "::error::CONFIG_KSU_SUSFS=y is not set in the final config"; exit 1; }
+            grep "^CONFIG_KSU_SUSFS" out/.config || true
+            grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "::error::CONFIG_KSU_SUSFS=y is not set in the final config (KSU=y needed first; KSU depends on KPROBES)"; grep -E "^CONFIG_(KSU|KPROBES|MODULES)" out/.config || true; exit 1; }
           else
-            echo "::warning::Building WITHOUT the SUSFS glue (variant: $VARIANT)"
-          fi
-          # FinaSU hooks via kprobes + the sys_enter tracepoint + a patched syscall table
-          # (no manual hooks), so these must be on or KSU silently drops out of the config.
-          if [ "$VARIANT" = "finasu" ]; then
-            scripts/config --file out/.config -e KPROBES -e FTRACE_SYSCALLS -e KSU
-            make O=out ARCH=arm64 olddefconfig
-            grep -E "^CONFIG_(KPROBES|FTRACE_SYSCALLS|HAVE_SYSCALL_TRACEPOINTS|EXT4_FS|KSU)=" out/.config || true
+            echo "::warning::No fs/susfs.c in source tree, building WITHOUT SUSFS"
           fi
           if [ "${{ inputs.disable_lto }}" = "true" ]; then
             scripts/config --file out/.config -d LTO_CLANG -d THINLTO -e LTO_NONE
@@ -389,7 +457,7 @@ jobs:
             2>&1 | tee build.log
 
       - name: Show build errors
-        if: failure()
+        if: failure() && hashFiles('build.log') != ''
         run: |
           grep -nE "error:|\*\*\*|undefined reference|ld.lld:" build.log | head -40 || true
           echo "---- last 30 lines ----"
