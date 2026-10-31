@@ -4,10 +4,11 @@ name: build
 # (sweet/sweetin) and publishes an AnyKernel3 zip as a GitHub Release. Nothing is
 # uploaded as an Actions artifact (avoids the artifact storage quota problem).
 #
-# Root solution is selectable (Run workflow -> ksu_variant):
-#   kernelsu-next : KernelSU Next legacy + manual hooks (the in-tree KernelSU-Next/ dir) + SUSFS glue
-#   finasu        : LyraVoid/FinaSU, newest release tag fetched at build time (or a ref you type in)
-# A normal push to ksu-next always builds kernelsu-next (finasu does not compile on this 4.14 tree).
+# Root solution: backslashxx/KernelSU (manual-hook KernelSU fork that still supports old kernels),
+# cloned at build time and wired in as drivers/kernelsu, plus NoMount (maxsteeel/nomount) integrated
+# into the kernel source with its setup.sh. No SUSFS for now.
+# The kernel tree's existing manual hooks (fs/exec.c, fs/open.c, ...) are used as they are;
+# if the fork expects different hook names the build log will show it.
 #
 # Put this file at .github/workflows/build.yml in the ksu-next branch. Every push to
 # ksu-next starts a build. The manual "Run workflow" button only shows up if the file is
@@ -18,21 +19,14 @@ on:
     branches: [ksu-next]
   workflow_dispatch:
     inputs:
-      ksu_variant:
-        description: "Root solution to build in"
-        type: choice
-        options:
-          - kernelsu-next
-          - finasu
-        default: kernelsu-next
-      finasu_ref:
-        description: "FinaSU only: 'latest' = newest release tag, or type a tag/branch (e.g. v1.3.2, master)"
+      ksu_ref:
+        description: "backslashxx/KernelSU ref: 'latest' = tip of its default branch, or type a tag/branch/commit"
         type: string
         default: latest
-      ksun_ref:
-        description: "KernelSU-Next only: empty = use the copy already in the kernel tree; 'latest' = newest commit of upstream branch 'legacy'; or type a branch/tag/commit"
+      nomount_ref:
+        description: "maxsteeel/nomount branch used for the kernel side (master = stable, dev = nightly). Install the matching NoMount module after flashing."
         type: string
-        default: ""
+        default: master
       disable_lto:
         description: "Build WITHOUT LTO (faster; use to debug a failing/boot-looping build)"
         type: boolean
@@ -47,16 +41,6 @@ env:
   # AOSP Clang 21.0.0 r563880c (same toolchain as the stock Spiteful kernel), pinned commit
   CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/f8439f0628d799092dd07df440a6334cab28939c/clang-r563880c.tar.gz
   CLANG_ID: r563880c
-  # KernelSU-Next "legacy" branch @165b87f (v3.4.0-legacy + fixes), ksuver = 30000 + 3027 commits + 289
-  KSU_VERSION: "33316"
-  KSU_TAG: "v3.4.0-legacy"
-  # FinaSU source
-  FINASU_REPO: LyraVoid/FinaSU
-  # SUSFS 2.3.0: core (fs/susfs.c + kernel hooks) is cherry-picked from tbyool/android_kernel_xiaomi_sm6150
-  # (commit "treewide: Import SUSFS 2.3.0"); the KernelSU-Next side is wired in by the glue script below.
-  # Core is used by both variants (FinaSU brings its own KernelSU-side glue). Set to "false" to build without SUSFS.
-  SUSFS_PATCH: "true"
-  SUSFS_CORE_COMMIT: 412885cb8318
   KBUILD_BUILD_USER: PsychoAvy
   KBUILD_BUILD_HOST: github
 
@@ -73,76 +57,53 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Select root variant
+      - name: Fetch backslashxx/KernelSU
         env:
-          GH_TOKEN: ${{ github.token }}
-          IN_VARIANT: ${{ inputs.ksu_variant }}
-          IN_FINASU_REF: ${{ inputs.finasu_ref }}
-          IN_KSUN_REF: ${{ inputs.ksun_ref }}
+          IN_KSU_REF: ${{ inputs.ksu_ref }}
         run: |
           set -e
-          VARIANT="${IN_VARIANT:-kernelsu-next}"
-          case "$VARIANT" in
-            kernelsu-next)
-              echo "VARIANT_NAME=KernelSU Next" >> "$GITHUB_ENV"
-              echo "SLUG=ksun" >> "$GITHUB_ENV"
-              KREF="${IN_KSUN_REF:-}"
-              if [ -n "$KREF" ]; then
-                # Replace the in-tree KernelSU-Next with a fresh upstream checkout (full history so
-                # the commit count, and therefore the version number, can be computed).
-                git clone --quiet https://github.com/KernelSU-Next/KernelSU-Next /tmp/ksun-up
-                echo "---- upstream branches ----"
-                git -C /tmp/ksun-up branch -r | head -20
-                [ "$KREF" = "latest" ] && KREF="origin/legacy"
-                git -C /tmp/ksun-up rev-parse -q --verify "${KREF}^{commit}" >/dev/null || { echo "::error::KernelSU-Next ref '$KREF' not found (see the branch list above)"; exit 1; }
-                git -C /tmp/ksun-up checkout -q "$KREF"
-                KCOUNT="$(git -C /tmp/ksun-up rev-list --count HEAD)"
-                KSHORT="$(git -C /tmp/ksun-up rev-parse --short HEAD)"
-                KTAG="$(git -C /tmp/ksun-up describe --tags --abbrev=0 2>/dev/null || echo "${KSU_TAG}")"
-                # same formula as the pinned KSU_VERSION: 30000 + commits + 289
-                KVER=$((30000 + KCOUNT + 289))
-                echo "Upstream KernelSU-Next: $KREF @ $KSHORT, $KCOUNT commits, tag $KTAG, version $KVER"
-                echo "(for reference, pinned 165b87f has $(git -C /tmp/ksun-up rev-list --count 165b87f 2>/dev/null || echo '?') commits here; expected 3027)"
-                test -f /tmp/ksun-up/kernel/Kconfig || { echo "::error::kernel/Kconfig missing in upstream ref $KREF"; exit 1; }
-                rm -rf KernelSU-Next
-                mv /tmp/ksun-up KernelSU-Next
-                rm -rf KernelSU-Next/.git
-                git add -A KernelSU-Next
-                git -c user.name=ci -c user.email=ci@localhost commit -q -m "ci: use upstream KernelSU-Next ${KSHORT}"
-                echo "KSUN_VERSION_USED=${KVER}" >> "$GITHUB_ENV"
-                echo "KSUN_TAG_USED=${KTAG}" >> "$GITHUB_ENV"
-                echo "KSUN_DESC=upstream ${KREF} @ ${KSHORT}" >> "$GITHUB_ENV"
-              fi
-              ;;
-            finasu)
-              REF="${IN_FINASU_REF:-latest}"
-              if [ "$REF" = "latest" ]; then
-                # newest published release; fall back to newest tag, then master
-                REF="$(gh api "repos/${FINASU_REPO}/releases/latest" --jq .tag_name 2>/dev/null || true)"
-                if [ -z "$REF" ]; then
-                  REF="$(git ls-remote --tags --refs --sort=-v:refname "https://github.com/${FINASU_REPO}" | head -1 | sed 's|.*refs/tags/||')"
-                fi
-                REF="${REF:-master}"
-              fi
-              echo "FinaSU ref: $REF"
-              git clone --branch "$REF" "https://github.com/${FINASU_REPO}" FinaSU
-              echo "---- newest FinaSU tags (type one into finasu_ref to try it) ----"
-              git ls-remote --tags --refs --sort=-v:refname "https://github.com/${FINASU_REPO}" | sed 's|.*refs/tags/||' | head -15 || true
-              test -f FinaSU/kernel/Kconfig || { echo "::error::FinaSU/kernel/Kconfig not found (ref $REF)"; exit 1; }
-              # point drivers/kernelsu at FinaSU instead of KernelSU-Next
-              rm -rf drivers/kernelsu
-              ln -s ../FinaSU/kernel drivers/kernelsu
-              ls -la drivers/kernelsu
-              FSHORT="$(git -C FinaSU rev-parse --short HEAD)"
-              echo "VARIANT_NAME=FinaSU ${REF}" >> "$GITHUB_ENV"
-              echo "SLUG=finasu" >> "$GITHUB_ENV"
-              echo "FINASU_RESOLVED=${REF} (${FSHORT})" >> "$GITHUB_ENV"
-              ;;
-            *)
-              echo "::error::Unknown ksu_variant: $VARIANT"; exit 1
-              ;;
-          esac
-          echo "VARIANT=$VARIANT" >> "$GITHUB_ENV"
+          REF="${IN_KSU_REF:-latest}"
+          git clone --quiet https://github.com/backslashxx/KernelSU KernelSU
+          echo "---- branches ----"
+          git -C KernelSU branch -r | head -20
+          if [ "$REF" != "latest" ]; then
+            git -C KernelSU rev-parse -q --verify "${REF}^{commit}" >/dev/null || git -C KernelSU rev-parse -q --verify "origin/${REF}^{commit}" >/dev/null || { echo "::error::ref '$REF' not found in backslashxx/KernelSU (see the branch list above)"; exit 1; }
+            git -C KernelSU checkout -q "$REF" 2>/dev/null || git -C KernelSU checkout -q "origin/$REF"
+          fi
+          SHORT="$(git -C KernelSU rev-parse --short HEAD)"
+          DESC="$(git -C KernelSU describe --tags --always)"
+          COUNT="$(git -C KernelSU rev-list --count HEAD)"
+          echo "backslashxx/KernelSU @ $SHORT ($DESC), $COUNT commits"
+          test -f KernelSU/kernel/Kconfig || { echo "::error::KernelSU/kernel/Kconfig not found"; ls -la KernelSU; exit 1; }
+          # point drivers/kernelsu at the fork (the kernel tree already sources drivers/kernelsu)
+          rm -rf drivers/kernelsu
+          ln -s ../KernelSU/kernel drivers/kernelsu
+          ls -la drivers/kernelsu
+          echo "---- Kconfig of the fork (config names, dependencies, defaults) ----"
+          grep -nE "^[[:space:]]*(menu)?config |depends on|default|select|prompt|bool|tristate" KernelSU/kernel/Kconfig | head -80
+          echo "VARIANT=xxksu" >> "$GITHUB_ENV"
+          echo "VARIANT_NAME=backslashxx KernelSU ${DESC}" >> "$GITHUB_ENV"
+          echo "SLUG=xxksu" >> "$GITHUB_ENV"
+          echo "KSU_DESC=backslashxx/KernelSU @ ${SHORT} (${DESC})" >> "$GITHUB_ENV"
+
+      - name: Integrate NoMount into the kernel
+        env:
+          IN_NM_REF: ${{ inputs.nomount_ref }}
+        run: |
+          set -e
+          NM_REF="${IN_NM_REF:-master}"
+          curl -fsSL "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/${NM_REF}/kernel/setup.sh" -o /tmp/nm_setup.sh \
+            || { echo "::error::could not download kernel/setup.sh from branch '${NM_REF}' of maxsteeel/nomount"; exit 1; }
+          echo "---- setup.sh (first 60 lines) ----"
+          head -60 /tmp/nm_setup.sh
+          echo "---- running it at the kernel tree root ----"
+          bash /tmp/nm_setup.sh "$NM_REF"
+          test -d fs/nomount || { echo "::error::fs/nomount was not created by setup.sh"; git status --short | head -30; exit 1; }
+          ls -la fs/nomount
+          grep -n "nomount" fs/Kconfig fs/Makefile || true
+          echo "---- fs/nomount/Kconfig ----"
+          cat fs/nomount/Kconfig 2>/dev/null | head -40 || true
+          echo "NM_DESC=maxsteeel/nomount branch ${NM_REF}" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         run: |
@@ -177,259 +138,20 @@ jobs:
           grep -rn "^config KSU" drivers/kernelsu/Kconfig || true
           # diagnostic only: grep exits 1 when nothing matches, which pipefail turns into a failed step
           grep -rIl "ksu_handle" fs kernel drivers/input 2>/dev/null | head || true
-
-      # Core SUSFS (fs/susfs.c + kernel hooks) is needed by both variants. The KernelSU-Next glue
-      # below only runs for kernelsu-next: FinaSU ships its own SUSFS glue (kernel/extension/susfs.c,
-      # built when CONFIG_KSU_SUSFS=y) and expects only the SUSFS kernel side to be present.
-      - name: Add SUSFS 2.3.0 (tbyool core + KernelSU-Next glue)
-        if: env.SUSFS_PATCH == 'true'
-        run: |
-          set -e
-          git config user.name "ci"
-          git config user.email "ci@localhost"
-          git remote add tbyool https://github.com/tbyool/android_kernel_xiaomi_sm6150
-          for d in 30 100 300 800 2000; do
-            git fetch --no-tags --depth=$d --filter=blob:none tbyool staging-buildout
-            if git rev-parse -q --verify "${SUSFS_CORE_COMMIT}~1" >/dev/null; then break; fi
-          done
-          git rev-parse --verify "${SUSFS_CORE_COMMIT}~1" >/dev/null || { echo "::error::SUSFS core commit ${SUSFS_CORE_COMMIT} not found"; exit 1; }
-          git show --stat --format='%h %s' "$SUSFS_CORE_COMMIT" | head -30
-          if ! git cherry-pick -n "$SUSFS_CORE_COMMIT"; then
-            echo "::error::cherry-pick of the SUSFS core failed"
-            git status --short | head -40
-            exit 1
-          fi
-          test -f fs/susfs.c
-          grep -n "susfs" fs/Makefile
-          python3 - <<'PY'
-          import os, re, pathlib, sys
-
-          K = pathlib.Path("KernelSU-Next/kernel")
-          FINASU = os.environ.get("VARIANT") == "finasu"
-
-          def edit(rel, fn):
-              if FINASU:
-                  print("glue: skip (FinaSU has its own SUSFS glue):", rel)
-                  return
-              p = K / rel
-              s = p.read_text()
-              n = fn(s)
-              if n == s:
-                  sys.exit("glue: nothing changed in %s (anchor not found or already patched)" % rel)
-              p.write_text(n)
-              print("glue: patched", rel)
-
-          # ---- 1. Kconfig: SUSFS options (2.3.0 names)
-          OPTS = [
-              ("SUS_PATH", "Hide suspicious paths (sus_path)"),
-              ("SUS_MOUNT", "Hide suspicious mounts (sus_mount)"),
-              ("SUS_KSTAT", "Spoof kstat of suspicious files (sus_kstat)"),
-              ("SPOOF_UNAME", "Spoof uname"),
-              ("ENABLE_LOG", "Enable SUSFS logging"),
-              ("HIDE_KSU_SUSFS_SYMBOLS", "Hide KernelSU and SUSFS symbols"),
-              ("SPOOF_CMDLINE_OR_BOOTCONFIG", "Spoof /proc/cmdline or bootconfig"),
-              ("OPEN_REDIRECT", "Redirect opened files (open_redirect)"),
-              ("SUS_MAP", "Hide suspicious memory maps (sus_map)"),
-          ]
-
-          def kconfig(s):
-              if "config KSU_SUSFS" in s:
-                  return s
-              blk = "\nconfig KSU_SUSFS\n\tbool \"KernelSU addon - SUSFS\"\n\tdepends on KSU=y\n\tdefault y\n\thelp\n\t  Hide KernelSU traces from apps. Needs the SUSFS core in the kernel\n\t  source (fs/susfs.c, include/linux/susfs*.h).\n"
-              for name, desc in OPTS:
-                  blk += "\nconfig KSU_SUSFS_%s\n\tbool \"%s\"\n\tdepends on KSU_SUSFS\n\tdefault y\n" % (name, desc)
-              i = s.rindex("endmenu")
-              return s[:i] + blk.lstrip("\n") + "\n" + s[i:]
-          edit("Kconfig", kconfig)
-
-          # ---- 2. selinux.c: domain helper used by susfs.c
-          def selinux(s):
-              if "susfs_is_current_ksu_domain" in s:
-                  return s
-              pat = re.compile(r"(bool is_ksu_domain\(void\)\s*\{[^}]*\}\n)")
-              add = "\n#ifdef CONFIG_KSU_SUSFS\nbool susfs_is_current_ksu_domain(void)\n{\n    return is_ksu_domain();\n}\n#endif\n"
-              return pat.sub(lambda m: m.group(1) + add, s, count=1)
-          edit("selinux/selinux.c", selinux)
-
-          # ---- 3. init.c: susfs_init() right after ksu_cred is ready
-          def init(s):
-              if "susfs_init" in s:
-                  return s
-              s = s.replace('#include "feature/adb_root.h"\n',
-                            '#include "feature/adb_root.h"\n#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs.h>\n#endif\n', 1)
-              pat = re.compile(r"^([ \t]*)ksu_feature_init\(\);", re.M)
-              return pat.sub(lambda m: "#ifdef CONFIG_KSU_SUSFS\n\tsusfs_init();\n#endif\n\n" + m.group(0), s, count=1)
-          edit("core/init.c", init)
-
-          # ---- 4. supercall.c: ksu_susfs commands arrive through the reboot hook
-          CMDS = [
-              ("CMD_SUSFS_ADD_SUS_PATH", "susfs_add_sus_path", "SUS_PATH"),
-              ("CMD_SUSFS_ADD_SUS_PATH_LOOP", "susfs_add_sus_path_loop", "SUS_PATH"),
-              ("CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS", "susfs_set_hide_sus_mnts_for_non_su_procs", "SUS_MOUNT"),
-              ("CMD_SUSFS_ADD_SUS_KSTAT", "susfs_add_sus_kstat", "SUS_KSTAT"),
-              ("CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY", "susfs_add_sus_kstat", "SUS_KSTAT"),
-              ("CMD_SUSFS_UPDATE_SUS_KSTAT", "susfs_update_sus_kstat", "SUS_KSTAT"),
-              ("CMD_SUSFS_SET_UNAME", "susfs_set_uname", "SPOOF_UNAME"),
-              ("CMD_SUSFS_ENABLE_LOG", "susfs_enable_log", "ENABLE_LOG"),
-              ("CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG", "susfs_set_cmdline_or_bootconfig", "SPOOF_CMDLINE_OR_BOOTCONFIG"),
-              ("CMD_SUSFS_ADD_OPEN_REDIRECT", "susfs_add_open_redirect", "OPEN_REDIRECT"),
-              ("CMD_SUSFS_ADD_SUS_MAP", "susfs_add_sus_map", "SUS_MAP"),
-              ("CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING", "susfs_set_avc_log_spoofing", None),
-              ("CMD_SUSFS_SHOW_ENABLED_FEATURES", "susfs_get_enabled_features", None),
-              ("CMD_SUSFS_SHOW_VARIANT", "susfs_show_variant", None),
-              ("CMD_SUSFS_SHOW_VERSION", "susfs_show_version", None),
-          ]
-
-          def supercall(s):
-              if "SUSFS_MAGIC" in s:
-                  return s
-              blk = "#ifdef CONFIG_KSU_SUSFS\n\tif (magic2 == SUSFS_MAGIC) {\n\t\t/* ksu_susfs runs as root */\n\t\tif (current_uid().val != 0)\n\t\t\treturn 0;\n"
-              for cmd, fn, cfg in CMDS:
-                  if cfg:
-                      blk += "#ifdef CONFIG_KSU_SUSFS_%s\n" % cfg
-                  blk += "\t\tif (cmd == %s) {\n\t\t\t%s(arg);\n\t\t\treturn 0;\n\t\t}\n" % (cmd, fn)
-                  if cfg:
-                      blk += "#endif\n"
-              blk += "\t\treturn 0;\n\t}\n#endif\n\n"
-              s = s.replace('#include "sulog/event.h"\n',
-                            '#include "sulog/event.h"\n#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs.h>\n#endif\n', 1)
-              pat = re.compile(r"^[ \t]*// extensions[ \t]*$", re.M)
-              if not pat.search(s):
-                  return s
-              return pat.sub(lambda m: blk + m.group(0), s, count=1)
-          edit("supercall/supercall.c", supercall)
-
-          # ---- 5. kernel_umount.c: mark umounted app processes for SUSFS
-          def umount(s):
-              if "susfs_set_current_proc_umounted" in s:
-                  return s
-              s = s.replace('#include "compat/kernel_compat.h"\n',
-                            '#include "compat/kernel_compat.h"\n#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n', 1)
-              # with SUSFS the sus_* hiding must apply even if no module uses a real mount (NoMount)
-              pat = re.compile(r"([ \t]*// if there isn't any module mounted, just ignore it!\s*\n[ \t]*if \(!ksu_module_mounted\) \{\s*\n[ \t]*return 0;\s*\n[ \t]*\}\n)")
-              s = pat.sub(lambda m: "#ifndef CONFIG_KSU_SUSFS\n" + m.group(1) + "#endif\n", s, count=1)
-              pat2 = re.compile(r"^([ \t]*)tw = kzalloc\(sizeof\(\*tw\), GFP_ATOMIC\);", re.M)
-              return pat2.sub(lambda m: "#ifdef CONFIG_KSU_SUSFS\n\tsusfs_set_current_proc_umounted();\n#endif\n\n" + m.group(0), s, count=1)
-          edit("feature/kernel_umount.c", umount)
-
-          # ---- 6. kernel files touched by the SUSFS core: make sure the SUSFS headers are included
-          ROOT = pathlib.Path(".")
-          CORE_FILES = [
-              "fs/stat.c", "fs/namei.c", "fs/namespace.c", "fs/readdir.c", "fs/statfs.c", "fs/super.c",
-              "fs/proc/base.c", "fs/proc/cmdline.c", "fs/proc/fd.c", "fs/proc/task_mmu.c",
-              "fs/proc_namespace.c", "fs/notify/fdinfo.c", "kernel/kallsyms.c", "kernel/sys.c",
-              "mm/memory.c", "security/selinux/avc.c",
-          ]
-          USE = re.compile(r"susfs|SUSFS|STATX_SUS_KSTAT|AS_FLAGS_SUS|AS_FLAGS_OPEN_REDIRECT|TIF_PROC_")
-
-          def add_header(text):
-              lines = text.split("\n")
-              if any(l.startswith("#include") and "susfs" in l for l in lines):
-                  return text, "already includes SUSFS header"
-              first_use = None
-              depth = 0
-              cand = None
-              for i, l in enumerate(lines):
-                  t = l.strip()
-                  if t.startswith("#include"):
-                      if depth == 0:
-                          cand = i
-                      continue
-                  if re.match(r"#\s*if", t):
-                      depth += 1
-                  elif re.match(r"#\s*endif", t):
-                      depth = max(0, depth - 1)
-                  if USE.search(l) and first_use is None:
-                      first_use = i
-                      break
-              if first_use is None:
-                  return text, "no SUSFS usage"
-              if cand is None:
-                  return text, "NO safe include position found"
-              lines[cand + 1:cand + 1] = ["#ifdef CONFIG_KSU_SUSFS", "#include <linux/susfs.h>", "#endif"]
-              return "\n".join(lines), "header added after line %d" % (cand + 1)
-
-          for rel in CORE_FILES:
-              p = ROOT / rel
-              if not p.exists():
-                  print("glue: skip (missing)", rel)
-                  continue
-              new, msg = add_header(p.read_text())
-              if new != p.read_text():
-                  p.write_text(new)
-              print("glue: %-28s %s" % (rel, msg))
-
-          # ---- 7. fs/stat.c: newfstat hook. The init.rc proxy only works if init sees a bigger st_size
-          #         (init reads exactly st_size bytes, so without this it never reaches EOF and ksud is never started)
-          def stat_hook(text):
-              if "ksu_handle_newfstat_ret" in text:
-                  return text, "already hooked"
-              m = re.search(r"^SYSCALL_DEFINE2\(newfstat,.*?^\}\n", text, re.S | re.M)
-              if not m:
-                  sys.exit("glue: SYSCALL_DEFINE2(newfstat) not found in fs/stat.c")
-              body = m.group(0)
-              if "\treturn error;\n}" not in body:
-                  sys.exit("glue: unexpected newfstat body in fs/stat.c:\n" + body)
-              new = body.replace("\treturn error;\n}",
-                                 "#ifdef CONFIG_KSU\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif\n\treturn error;\n}", 1)
-              decl = ("#ifdef CONFIG_KSU\nextern void ksu_handle_newfstat_ret(unsigned int *fd, "
-                      "struct stat __user **statbuf_ptr);\n#endif\n\n")
-              return text[:m.start()] + decl + new + text[m.end():], "newfstat hook added"
-
-          if FINASU:
-              print("glue: fs/stat.c newfstat hook skipped (FinaSU)")
-          else:
-              _p = ROOT / "fs/stat.c"
-              _new, _msg = stat_hook(_p.read_text())
-              if _new != _p.read_text():
-                  _p.write_text(_new)
-              print("glue: fs/stat.c", _msg)
-
-          print("glue: done")
-          PY
-          grep -n -B2 -A2 ksu_handle_newfstat_ret fs/stat.c || true
-          git status --short | head -40
-
-      # FinaSU is written for newer kernels. This only reports how many newer-kernel APIs the chosen
-      # FinaSU ref uses (warning, never fails), so a hopeless ref is obvious from the log.
-      - name: FinaSU compatibility probe (kernel 4.14)
-        if: env.VARIANT == 'finasu'
-        run: |
-          TOTAL=0
-          for m in selinux_policy TWA_RESUME remap_file_range handle_inode_event copy_to_kernel_nofault copy_from_user_nofault alloc_file_pseudo filename_trans_key; do
-            N="$(grep -RIl "$m" drivers/kernelsu/ 2>/dev/null | wc -l)"
-            echo "  $m: used in $N file(s)"
-            TOTAL=$((TOTAL + N))
-          done
-          if [ "$TOTAL" -gt 0 ]; then
-            echo "::warning::FinaSU ${FINASU_RESOLVED} uses APIs missing from 4.14 ($TOTAL hits); expect compile errors. Try an older finasu_ref."
-          else
-            echo "No known newer-kernel APIs found in FinaSU ${FINASU_RESOLVED}"
-          fi
-
-      # FinaSU needs FTRACE_SYSCALLS, which turns tracing on. That compiles the msm-4.14 sched trace
-      # events, which reference fields that do not exist in this tree (cpu_load[], util_est.*).
-      # Patch only the failing expressions (see build log: sched.h:169, 1421, 1422, 1452).
-      - name: Fix sched trace events for tracing builds (FinaSU only)
-        if: env.VARIANT == 'finasu'
-        run: |
-          F=include/trace/events/sched.h
-          sed -i \
-            -e 's/task_rq(p)->cpu_load\[0\]/0/' \
-            -e 's/avg->util_est\.enqueued/avg->util_est/' \
-            -e 's/avg->util_est\.ewma/0/' \
-            -e 's/cfs_rq->avg\.util_est\.enqueued/cfs_rq->avg.util_est/' \
-            "$F"
-          git diff --stat -- "$F" || true
-          grep -nE "cpu_load|util_est" "$F" | head -20 || true
+          echo "---- ksu_* names the kernel tree calls (outside the driver) ----"
+          { grep -rhoE "ksu_[a-zA-Z0-9_]+" fs kernel drivers/input include 2>/dev/null | sort -u || true; } | head -60
+          echo "---- ksu_handle_* names the driver provides ----"
+          { grep -rhoE "ksu_handle_[a-zA-Z0-9_]+" drivers/kernelsu/ 2>/dev/null | sort -u || true; } | head -60
 
       - name: Configure kernel
         run: |
           make O=out ARCH=arm64 "$DEFCONFIG"
-          # Helper: read the real 'depends on' chain of CONFIG_KSU from the Kconfig files in this
-          # tree (it differs between KernelSU versions) and switch it all on.
+          # Helper: read the real 'depends on' chain of a config symbol (default KSU, or NOMOUNT) from the
+          # Kconfig files in this tree and switch it all on.
           cat > /tmp/ksu_deps.py <<'PY'
           import os, re, subprocess, sys
+
+          target = sys.argv[1] if len(sys.argv) > 1 else "KSU"
 
           def read(p):
               try:
@@ -447,17 +169,14 @@ jobs:
 
           blocks = {}
           for root, dirs, files in os.walk("."):
-              dirs[:] = [d for d in dirs if d not in (".git", "out", "FinaSU", "KernelSU-Next", "Documentation")]
+              dirs[:] = [d for d in dirs if d not in (".git", "out", "KernelSU", "Documentation")]
               for f in files:
                   if f.startswith("Kconfig"):
                       parse(read(os.path.join(root, f)), blocks)
-          ksu = read("drivers/kernelsu/Kconfig")
-          if "config KSU" not in ksu:
-              sys.exit("drivers/kernelsu/Kconfig has no 'config KSU'")
-          m = re.search(r"^config KSU[ \t]*\n(.*?)(?=^\S)", ksu, re.S | re.M)
-          print("---- config KSU ----")
-          print("config KSU\n" + (m.group(1) if m else ""))
-          parse(ksu, blocks)
+          parse(read("drivers/kernelsu/Kconfig"), blocks)
+          if target not in blocks:
+              sys.exit("config %s not found in any Kconfig (is it sourced?)" % target)
+          print("---- config %s: depends on %s ----" % (target, blocks[target] or "-"))
 
           def terms(expr):
               expr = re.sub(r"\s+if\s+.*$", "", expr)
@@ -484,91 +203,51 @@ jobs:
                       else:
                           want(s, depth + 1)
 
-          want("KSU")
+          want(target)
           args = []
-          for s in reversed(enable):          # dependencies first, KSU last
+          for s in reversed(enable):          # dependencies first, target last
               args += ["-e", s]
           for s in disable:
               args += ["-d", s]
           print("deps: enable", " ".join(reversed(enable)), "| disable", " ".join(disable) or "-")
           subprocess.check_call(["scripts/config", "--file", "out/.config"] + args)
           PY
-          # FinaSU hooks via kprobes + the sys_enter tracepoint + a patched syscall table,
-          # so these must be on BEFORE the SUSFS step, or KSU (and KSU_SUSFS) silently drop out.
-          # Dependency chain on 4.14 (sweet_defconfig has none of it on):
-          #   KSU -> KPROBES + EXT4_FS ; KPROBES -> MODULES + HAVE_KPROBES ; KALLSYMS_ALL -> DEBUG_KERNEL + KALLSYMS
-          #   FTRACE_SYSCALLS -> FTRACE (turns on the syscall tracepoints FinaSU's sys_enter hook needs)
-          if [ "$VARIANT" = "finasu" ]; then
-            scripts/config --file out/.config \
-              -e MODULES -e DEBUG_KERNEL -e KALLSYMS -e KALLSYMS_ALL \
-              -e KPROBES -e FTRACE -e FTRACE_SYSCALLS -e EXT4_FS -e OVERLAY_FS -e KSU
-            make O=out ARCH=arm64 olddefconfig
-            # olddefconfig silently drops CONFIG_KSU when one of its 'depends on' symbols is off.
-            # Read the real dependencies from FinaSU's own Kconfig (they change between releases)
-            # and switch them on, instead of guessing the list by hand.
-            for round in 1 2 3; do
-              grep -q "^CONFIG_KSU=y" out/.config && break
-              echo "---- KSU still off (round $round): resolving deps from drivers/kernelsu/Kconfig ----"
-              python3 /tmp/ksu_deps.py
-              make O=out ARCH=arm64 olddefconfig
-            done
-            MISSING=""
-            for s in MODULES KPROBES KALLSYMS_ALL EXT4_FS OVERLAY_FS FTRACE_SYSCALLS HAVE_SYSCALL_TRACEPOINTS THREAD_INFO_IN_TASK KSU; do
-              if grep -q "^CONFIG_${s}=y" out/.config; then echo "  CONFIG_${s}=y"; else echo "  CONFIG_${s} NOT SET"; MISSING="$MISSING $s"; fi
-            done
-            if [ -n "$MISSING" ]; then
-              echo "::error::FinaSU prerequisites missing after olddefconfig:$MISSING"
-              echo "---- config KSU block as the kernel sees it ----"
-              sed -n '/^config KSU$/,/^config KSU_/p' drivers/kernelsu/Kconfig || true
-              echo "---- is the Kconfig sourced? ----"
-              grep -rn "kernelsu" drivers/Kconfig drivers/Makefile || true
-              echo "---- Kconfig dependencies of the missing symbols ----"
-              for s in $MISSING; do grep -rn -A8 "^config $s\$" arch/Kconfig arch/arm64/Kconfig init/Kconfig kernel/trace/Kconfig lib/Kconfig.debug fs/Kconfig fs/overlayfs/Kconfig 2>/dev/null | head -14; done
-              exit 1
-            fi
-          fi
-          # KernelSU-Next: a newer upstream ref can bring new 'depends on' lines that make olddefconfig
-          # drop CONFIG_KSU (and with it KSU_SUSFS). Resolve them from the Kconfig instead of failing.
-          if [ "$VARIANT" = "kernelsu-next" ] && ! grep -q "^CONFIG_KSU=y" out/.config; then
+          # A different KernelSU version can bring new 'depends on' lines that make olddefconfig
+          # drop CONFIG_KSU Resolve them from the Kconfig instead of failing.
+          if ! grep -q "^CONFIG_KSU=y" out/.config; then
             echo "---- CONFIG_KSU is off after defconfig; resolving its dependencies ----"
             for round in 1 2; do
-              python3 /tmp/ksu_deps.py
+              python3 /tmp/ksu_deps.py KSU
               make O=out ARCH=arm64 olddefconfig
               grep -q "^CONFIG_KSU=y" out/.config && break
             done
             grep -E "^CONFIG_(KSU|KPROBES|MODULES|OVERLAY_FS)=" out/.config || true
           fi
-          # SUSFS: every SUSFS sub-option defaults to y once KSU_SUSFS is on (both variants)
-          if [ -f fs/susfs.c ]; then
-            echo "SUSFS found in source tree, enabling"
-            scripts/config --file out/.config -e KSU_SUSFS
+          # NoMount (maxsteeel/nomount) was copied into fs/nomount by the previous steps
+          scripts/config --file out/.config -e NOMOUNT
+          make O=out ARCH=arm64 olddefconfig
+          if ! grep -q "^CONFIG_NOMOUNT=y" out/.config; then
+            echo "---- CONFIG_NOMOUNT is off; resolving its dependencies ----"
+            python3 /tmp/ksu_deps.py NOMOUNT
             make O=out ARCH=arm64 olddefconfig
-            grep "^CONFIG_KSU_SUSFS" out/.config || true
-            grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "::error::CONFIG_KSU_SUSFS=y is not set in the final config (KSU=y needed first; KSU depends on KPROBES)"; grep -E "^CONFIG_(KSU|KPROBES|MODULES)" out/.config || true; exit 1; }
-          else
-            echo "::warning::No fs/susfs.c in source tree, building WITHOUT SUSFS"
           fi
+          grep -E "^CONFIG_NOMOUNT" out/.config || true
+          grep -q "^CONFIG_NOMOUNT=y" out/.config || { echo "::error::CONFIG_NOMOUNT=y is not set in the final config"; sed -n '1,60p' fs/nomount/Kconfig 2>/dev/null || true; exit 1; }
           if [ "${{ inputs.disable_lto }}" = "true" ]; then
             scripts/config --file out/.config -d LTO_CLANG -d THINLTO -e LTO_NONE
             make O=out ARCH=arm64 olddefconfig
           fi
-          grep -E "^CONFIG_KSU|^CONFIG_KPROBES|^CONFIG_LTO|^CONFIG_THINLTO|^CONFIG_CFI|^CONFIG_LOCALVERSION=" out/.config || true
+          grep -E "^CONFIG_KSU|^CONFIG_KPROBES|^CONFIG_MODULES=|^CONFIG_LTO|^CONFIG_THINLTO|^CONFIG_CFI|^CONFIG_LOCALVERSION=" out/.config || true
           grep -q "^CONFIG_KSU=y" out/.config || { echo "::error::CONFIG_KSU=y is not set in the final config"; exit 1; }
 
       - name: Build kernel
         run: |
-          # version overrides only exist for KernelSU-Next; FinaSU computes its own version
-          EXTRA=()
-          if [ "$VARIANT" = "kernelsu-next" ]; then
-            EXTRA=(KSU_VERSION_OVERRIDE="${KSUN_VERSION_USED:-$KSU_VERSION}" KSU_VERSION_TAG_OVERRIDE="${KSUN_TAG_USED:-$KSU_TAG}")
-          fi
           make -k -j"$(nproc)" O=out ARCH=arm64 \
             CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
-            "${EXTRA[@]}" \
             2>&1 | tee build.log
 
       - name: Show build errors
@@ -601,11 +280,11 @@ jobs:
             echo "::error::No KernelSU/FinaSU strings found in the kernel image"; exit 1
           fi
           echo "KernelSU/FinaSU strings found in Image: $COUNT"
-          SUSFS_COUNT="$(strings -n 6 out/arch/arm64/boot/Image | grep -ci "susfs" || true)"
-          if [ -f fs/susfs.c ] && [ "${SUSFS_COUNT:-0}" -eq 0 ]; then
-            echo "::error::fs/susfs.c exists but no SUSFS strings found in the kernel image"; exit 1
+          NMC="$(strings -n 6 out/arch/arm64/boot/Image | grep -ci "nomount" || true)"
+          if [ "${NMC:-0}" -eq 0 ]; then
+            echo "::error::No NoMount strings found in the kernel image"; exit 1
           fi
-          echo "SUSFS strings found in Image: $SUSFS_COUNT"
+          echo "NoMount strings found in Image: $NMC"
 
       - name: Package AnyKernel3 zip
         id: pack
@@ -661,12 +340,8 @@ jobs:
           {
             echo "Kernel: ${{ steps.verify.outputs.krel }}"
             echo "Source: ${{ github.repository }}@${{ steps.pack.outputs.short }} (branch ${{ github.ref_name }})"
-            if [ -f fs/susfs.c ]; then SUS="SUSFS"; else SUS="no SUSFS"; fi
-            if [ "$VARIANT" = "finasu" ]; then
-              echo "Root: FinaSU ${FINASU_RESOLVED} (${FINASU_REPO}), ${SUS}"
-            else
-              echo "Root: KernelSU Next (legacy, manual hooks), ${SUS}; source: ${KSUN_DESC:-copy in the kernel tree}"
-            fi
+            echo "Root: ${KSU_DESC}, manual hooks, no SUSFS"
+            echo "NoMount: ${NM_DESC} (kernel side). Install the matching NoMount metamodule after flashing."
             echo "Toolchain: AOSP Clang ${CLANG_ID}"
             echo "LTO disabled: ${{ inputs.disable_lto }}"
             echo
