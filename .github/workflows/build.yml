@@ -297,9 +297,12 @@ jobs:
           echo "SUSFS_DESC=simonpunk/susfs4ksu kernel-4.14 @ $(git -C /tmp/susfs rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          # the runner's default Ubuntu mirror sometimes hangs; fail fast and retry instead of burning the whole job timeout
+          APT="sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20"
+          for i in 1 2 3; do $APT update && break || { echo "apt update failed (try $i)"; sleep 10; }; done
+          $APT install -y --no-install-recommends \
             bc bison flex libssl-dev libelf-dev cpio zip unzip lz4 xz-utils \
             python3 device-tree-compiler make gcc \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
