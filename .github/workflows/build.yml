@@ -228,6 +228,14 @@ jobs:
             exit 1
           fi
 
+          # This kernel's struct cred has "atomic_long_t usage", but the get_cred_rcu() helper that the SUSFS
+          # Makefile injects into include/linux/cred.h uses atomic_inc_not_zero() (atomic_t) -> compile error everywhere.
+          if grep -Eq "atomic_long_t[[:space:]]+usage" include/linux/cred.h; then
+            sed -i 's/atomic_inc_not_zero(&nonconst_cred->usage)/atomic_long_inc_not_zero(\&nonconst_cred->usage)/' KernelSU/kernel/Makefile
+            echo "KernelSU Makefile: get_cred_rcu now uses atomic_long_inc_not_zero"
+          fi
+          grep -n "inc_not_zero" KernelSU/kernel/Makefile || { echo "::error::get_cred_rcu helper not found in KernelSU/kernel/Makefile"; exit 1; }
+
           echo "---- 2/3: kernel side patch ----"
           patch -p1 --batch --no-backup-if-mismatch < "$KPATCH" || true
           cat > /tmp/kernel_fix.py <<'PY'
