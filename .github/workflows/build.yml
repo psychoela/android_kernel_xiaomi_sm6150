@@ -32,9 +32,9 @@ on:
         type: boolean
         default: false
       enable_susfs:
-        description: "EXPERIMENTAL: add SUSFS (simonpunk/susfs4ksu, branch kernel-4.14) on top of KernelSU, together with NoMount"
+        description: "EXPERIMENTAL: build with SUSFS (switches root to tiann/KernelSU, needs the official v0.9.5 manager). Off = backslashxx/KernelSU + NoMount"
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
@@ -47,8 +47,9 @@ env:
   CLANG_ID: r563880c
   KBUILD_BUILD_USER: PsychoAvy
   KBUILD_BUILD_HOST: github
-  # SUSFS is on for push builds; for manual runs it follows the enable_susfs input
-  ENABLE_SUSFS: ${{ github.event_name != 'workflow_dispatch' || inputs.enable_susfs }}
+  # SUSFS is OFF for push builds (backslashxx/KernelSU + NoMount); it is only built when a manual
+  # run ticks enable_susfs, which switches the root solution to tiann/KernelSU (see "Fetch KernelSU")
+  ENABLE_SUSFS: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_susfs }}
 
 jobs:
   build:
