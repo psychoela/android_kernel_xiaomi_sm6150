@@ -32,9 +32,9 @@ on:
         type: boolean
         default: false
       enable_susfs:
-        description: "EXPERIMENTAL: add SUSFS (simonpunk/susfs4ksu, branch kernel-4.14) on top of KernelSU, together with NoMount"
+        description: "EXPERIMENTAL: build with SUSFS (switches root to tiann/KernelSU, needs the official v0.9.5 manager). Off = backslashxx/KernelSU + NoMount"
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
@@ -47,8 +47,9 @@ env:
   CLANG_ID: r563880c
   KBUILD_BUILD_USER: PsychoAvy
   KBUILD_BUILD_HOST: github
-  # SUSFS is on for push builds; for manual runs it follows the enable_susfs input
-  ENABLE_SUSFS: ${{ github.event_name != 'workflow_dispatch' || inputs.enable_susfs }}
+  # SUSFS is OFF for push builds (backslashxx/KernelSU + NoMount); it is only built when a manual
+  # run ticks enable_susfs, which switches the root solution to tiann/KernelSU (see "Fetch KernelSU")
+  ENABLE_SUSFS: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_susfs }}
 
 jobs:
   build:
@@ -63,13 +64,21 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Fetch backslashxx/KernelSU
+      - name: Fetch KernelSU
         env:
           IN_KSU_REF: ${{ inputs.ksu_ref }}
         run: |
           set -e
           REF="${IN_KSU_REF:-latest}"
-          git clone --quiet https://github.com/backslashxx/KernelSU KernelSU
+          if [ "$ENABLE_SUSFS" = "true" ]; then
+            # SUSFS: the kernel-4.14 SUSFS patch is written against tiann/KernelSU from late May 2024
+            # (non-GKI support still present). bd5100d6 is the closest commit (only 1 hunk needs porting).
+            KSU_REPO="tiann/KernelSU"
+            [ "$REF" = "latest" ] && REF="bd5100d6"
+          else
+            KSU_REPO="backslashxx/KernelSU"
+          fi
+          git clone --quiet "https://github.com/${KSU_REPO}" KernelSU
           echo "---- branches ----"
           git -C KernelSU branch -r | head -20
           if [ "$REF" != "latest" ]; then
@@ -79,7 +88,7 @@ jobs:
           SHORT="$(git -C KernelSU rev-parse --short HEAD)"
           DESC="$(git -C KernelSU describe --tags --always)"
           COUNT="$(git -C KernelSU rev-list --count HEAD)"
-          echo "backslashxx/KernelSU @ $SHORT ($DESC), $COUNT commits"
+          echo "${KSU_REPO} @ $SHORT ($DESC), $COUNT commits"
           test -f KernelSU/kernel/Kconfig || { echo "::error::KernelSU/kernel/Kconfig not found"; ls -la KernelSU; exit 1; }
           # point drivers/kernelsu at the fork (the kernel tree already sources drivers/kernelsu)
           rm -rf drivers/kernelsu
@@ -87,10 +96,16 @@ jobs:
           ls -la drivers/kernelsu
           echo "---- Kconfig of the fork (config names, dependencies, defaults) ----"
           grep -nE "^[[:space:]]*(menu)?config |depends on|default|select|prompt|bool|tristate" KernelSU/kernel/Kconfig | head -80
-          echo "VARIANT=xxksu" >> "$GITHUB_ENV"
-          echo "VARIANT_NAME=backslashxx KernelSU ${DESC}" >> "$GITHUB_ENV"
-          echo "SLUG=xxksu" >> "$GITHUB_ENV"
-          echo "KSU_DESC=backslashxx/KernelSU @ ${SHORT} (${DESC})" >> "$GITHUB_ENV"
+          if [ "$ENABLE_SUSFS" = "true" ]; then
+            echo "VARIANT=susfs" >> "$GITHUB_ENV"
+            echo "VARIANT_NAME=KernelSU ${SHORT} + SUSFS" >> "$GITHUB_ENV"
+            echo "SLUG=susfs" >> "$GITHUB_ENV"
+          else
+            echo "VARIANT=xxksu" >> "$GITHUB_ENV"
+            echo "VARIANT_NAME=backslashxx KernelSU ${DESC}" >> "$GITHUB_ENV"
+            echo "SLUG=xxksu" >> "$GITHUB_ENV"
+          fi
+          echo "KSU_DESC=${KSU_REPO} @ ${SHORT} (${DESC})" >> "$GITHUB_ENV"
 
       - name: Integrate NoMount into the kernel
         env:
@@ -119,6 +134,7 @@ jobs:
       #  2. fs/stat.c needs the newfstat return hook, otherwise init never sees the enlarged init.rc
       #     (required on Android 16+, harmless on older).
       - name: Adapt manual hooks for backslashxx/KernelSU
+        if: env.ENABLE_SUSFS != 'true'
         run: |
           set -e
           cat > fs/ksu_hook_stubs.c <<'EOF'
@@ -161,43 +177,141 @@ jobs:
           git --no-pager diff --stat -- fs/stat.c fs/Makefile || true
           grep -n -B3 -A3 "ksu_handle_newfstat_ret" fs/stat.c | head -30
 
-      # EXPERIMENTAL. SUSFS patches are written for tiann/KernelSU-style hooks; this tree uses
-      # backslashxx/KernelSU (scope-minimized hooks) + NoMount, so some hunks may not apply.
-      # If anything fails, the log lists the failing hunks (.rej files) so the patch can be adapted.
+      # EXPERIMENTAL. SUSFS kernel-4.14 patches (simonpunk/susfs4ksu, pinned) + tiann/KernelSU @ bd5100d6.
+      # Known gaps handled here: one KernelSU hunk (selinux.c) and three optional kernel hunks
+      # (task_mmu.c include, sys.c uname spoof, cmdline.c spoof) are ported by small scripts.
+      # Anything else that fails stops the build and prints the rejected hunks.
       - name: Integrate SUSFS (experimental)
         if: env.ENABLE_SUSFS == 'true'
         run: |
           set -e
-          git clone --quiet --depth=1 -b kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu /tmp/susfs
+          rm -rf /tmp/susfs
+          git clone --quiet -b kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu /tmp/susfs \
+            || git clone --quiet -b kernel-4.14 https://github.com/kutemeikito/susfs4ksu /tmp/susfs
+          git -C /tmp/susfs checkout -q 77905b5 || echo "::warning::pinned SUSFS commit 77905b5 not found, using branch tip"
           echo "SUSFS @ $(git -C /tmp/susfs rev-parse --short HEAD)"
-          echo "---- files in susfs4ksu (kernel-4.14) ----"
-          find /tmp/susfs -type f -not -path '*/.git/*' | sort | head -60
           P=/tmp/susfs/kernel_patches
-          test -d "$P" || { echo "::error::kernel_patches/ not found in susfs4ksu kernel-4.14"; exit 1; }
-          KPATCH="$(ls "$P"/50_add_susfs_in_kernel-*.patch 2>/dev/null | head -1)"
+          KPATCH="$P/50_add_susfs_in_kernel-4.14.patch"
           SPATCH="$P/KernelSU/10_enable_susfs_for_ksu.patch"
-          test -n "$KPATCH" || { echo "::error::50_add_susfs_in_kernel-*.patch not found"; exit 1; }
-          test -f "$SPATCH" || { echo "::error::10_enable_susfs_for_ksu.patch not found"; exit 1; }
-          echo "kernel patch: $KPATCH"
+          test -f "$KPATCH" || { echo "::error::$KPATCH not found"; exit 1; }
+          test -f "$SPATCH" || { echo "::error::$SPATCH not found"; exit 1; }
           cp -v "$P"/fs/*.c fs/
           cp -v "$P"/include/linux/*.h include/linux/
-          echo "---- 1/2: KernelSU side patch (dry run first) ----"
-          ( cd KernelSU && patch -p1 --dry-run < "$SPATCH" ) \
-            || { echo "::error::SUSFS KernelSU-side patch does not apply to backslashxx/KernelSU"; exit 1; }
-          ( cd KernelSU && patch -p1 --no-backup-if-mismatch < "$SPATCH" )
-          echo "---- 2/2: kernel side patch ----"
-          patch -p1 --no-backup-if-mismatch < "$KPATCH" || {
-            echo "::error::SUSFS kernel patch has failing hunks (see .rej files below)"
-            find . -name '*.rej' -not -path './out/*' | head -20
-            for f in $(find . -name '*.rej' -not -path './out/*' | head -5); do echo "=== $f ==="; cat "$f"; done
+
+          echo "---- 1/3: KernelSU side patch ----"
+          ( cd KernelSU && patch -p1 --batch --no-backup-if-mismatch < "$SPATCH" ) || true
+          cat > /tmp/ksu_fix.py <<'PY'
+          import pathlib, re, sys
+          # Port the SUSFS hunks that do not apply to backslashxx-free tiann KernelSU: selinux.c.rej
+          rej = pathlib.Path("KernelSU/kernel/selinux/selinux.c.rej")
+          if rej.exists():
+              txt = rej.read_text()
+              add = [l[1:] for l in txt.splitlines() if l.startswith("+") and not l.startswith("+++")]
+              if not add or "susfs_set_sid" not in "\n".join(add):
+                  sys.exit("selinux.c.rej does not look like the expected SUSFS hunk")
+              p = pathlib.Path("KernelSU/kernel/selinux/selinux.c")
+              t = p.read_text()
+              if "susfs_set_sid" not in t:
+                  anchor = "#define DEVPTS_DOMAIN"
+                  i = t.find(anchor)
+                  if i < 0:
+                      sys.exit("anchor '#define DEVPTS_DOMAIN' not found in selinux.c")
+                  t = t[:i] + "\n".join(add) + "\n" + t[i:]
+                  p.write_text(t)
+              rej.unlink()
+              print("selinux.c: ported the rejected SUSFS hunk")
+          PY
+
+          python3 -I /tmp/ksu_fix.py
+          if [ -n "$(find KernelSU -name '*.rej')" ]; then
+            echo "::error::SUSFS KernelSU-side patch has unported rejected hunks"
+            for f in $(find KernelSU -name '*.rej'); do echo "=== $f ==="; cat "$f"; done
             exit 1
+          fi
+
+          # This kernel's struct cred has "atomic_long_t usage", but the get_cred_rcu() helper that the SUSFS
+          # Makefile injects into include/linux/cred.h uses atomic_inc_not_zero() (atomic_t) -> compile error everywhere.
+          if grep -Eq "atomic_long_t[[:space:]]+usage" include/linux/cred.h; then
+            sed -i 's/atomic_inc_not_zero(&nonconst_cred->usage)/atomic_long_inc_not_zero(\&nonconst_cred->usage)/' KernelSU/kernel/Makefile
+            echo "KernelSU Makefile: get_cred_rcu now uses atomic_long_inc_not_zero"
+          fi
+          grep -n "inc_not_zero" KernelSU/kernel/Makefile || { echo "::error::get_cred_rcu helper not found in KernelSU/kernel/Makefile"; exit 1; }
+
+          echo "---- 2/3: kernel side patch ----"
+          patch -p1 --batch --no-backup-if-mismatch < "$KPATCH" || true
+          cat > /tmp/kernel_fix.py <<'PY'
+          import pathlib, re, sys
+
+          def rd(p): return pathlib.Path(p).read_text()
+          def wr(p, t): pathlib.Path(p).write_text(t)
+
+          # fs/proc/task_mmu.c: include susfs_def.h (needed by the hunks that did apply)
+          p = "fs/proc/task_mmu.c"; t = rd(p)
+          if "susfs_def.h" not in t:
+              a = "#include <linux/uaccess.h>\n"
+              if a not in t: sys.exit("task_mmu.c: anchor not found")
+              wr(p, t.replace(a, a + "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n", 1))
+              print("task_mmu.c: include added")
+
+          # kernel/sys.c: uname spoof hook
+          p = "kernel/sys.c"; t = rd(p)
+          if "susfs_spoof_uname" not in t:
+              a = "SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)\n{"
+              if a not in t: sys.exit("sys.c: newuname not found")
+              t = t.replace(a, "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\nextern void susfs_spoof_uname(struct new_utsname* tmp);\n#endif\n" + a, 1)
+              m = re.search(r"SYSCALL_DEFINE1\(newuname.*?memcpy\(&tmp, utsname\(\), sizeof\(tmp\)\);\n", t, re.S)
+              if not m: sys.exit("sys.c: memcpy in newuname not found")
+              t = t[:m.end()] + "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n\tsusfs_spoof_uname(&tmp);\n#endif\n" + t[m.end():]
+              wr(p, t)
+              print("sys.c: uname spoof hook added")
+
+          # fs/proc/cmdline.c: cmdline spoof hook
+          p = "fs/proc/cmdline.c"; t = rd(p)
+          if "susfs_spoof_cmdline_or_bootconfig" not in t:
+              a = "static int cmdline_proc_show(struct seq_file *m, void *v)\n{\n"
+              if a not in t: sys.exit("cmdline.c: cmdline_proc_show not found")
+              t = t.replace(a,
+                  "#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\nextern int susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);\n#endif\n\n" + a +
+                  "#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n\tif (!susfs_spoof_cmdline_or_bootconfig(m)) {\n\t\tseq_putc(m, '\\n');\n\t\treturn 0;\n\t}\n#endif\n", 1)
+              wr(p, t)
+              print("cmdline.c: cmdline spoof hook added")
+          PY
+
+          python3 -I /tmp/kernel_fix.py
+          # these three .rej files were ported by kernel_fix.py above; anything else is a real failure
+          rm -f fs/proc/task_mmu.c.rej kernel/sys.c.rej fs/proc/cmdline.c.rej
+          if [ -n "$(find . -name '*.rej' -not -path './out/*' -not -path './KernelSU/*')" ]; then
+            echo "::error::SUSFS kernel patch has failing hunks"
+            for f in $(find . -name '*.rej' -not -path './out/*' -not -path './KernelSU/*'); do echo "=== $f ==="; cat "$f"; done
+            exit 1
+          fi
+
+          echo "---- 3/3: hook stubs ----"
+          # kernel/reboot.c calls ksu_handle_sys_reboot; this KernelSU version does not provide it
+          if ! grep -rq "ksu_handle_sys_reboot" KernelSU/kernel; then
+            cat > fs/ksu_susfs_stubs.c <<'EOF'
+          // SPDX-License-Identifier: GPL-2.0
+          #include <linux/types.h>
+          #include <linux/compiler.h>
+
+          int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg)
+          {
+          	return 0;
           }
+          EOF
+            grep -q "ksu_susfs_stubs" fs/Makefile || echo 'obj-$(CONFIG_KSU) += ksu_susfs_stubs.o' >> fs/Makefile
+            echo "added ksu_handle_sys_reboot stub"
+          fi
+          git --no-pager diff --stat | tail -30 || true
           echo "SUSFS_DESC=simonpunk/susfs4ksu kernel-4.14 @ $(git -C /tmp/susfs rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          # the runner's default Ubuntu mirror sometimes hangs; fail fast and retry instead of burning the whole job timeout
+          APT="sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20"
+          for i in 1 2 3; do $APT update && break || { echo "apt update failed (try $i)"; sleep 10; }; done
+          $APT install -y --no-install-recommends \
             bc bison flex libssl-dev libelf-dev cpio zip unzip lz4 xz-utils \
             python3 device-tree-compiler make gcc \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
@@ -434,6 +548,16 @@ jobs:
           (cd AnyKernel3 && zip -r9 "../$ZIP" . -x '.git*')
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
           echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          # SUSFS: ship the userspace module that matches this kernel's SUSFS version (newer third-party
+          # modules talk to the kernel in a different way and fail with "SUSFS operation not supported")
+          if [ "$ENABLE_SUSFS" = "true" ] && [ -d /tmp/susfs/ksu_module_susfs ]; then
+            MV="$(grep '^version=' /tmp/susfs/ksu_module_susfs/module.prop | cut -d= -f2 | tr -d '\r')"
+            MZIP="susfs4ksu-module-${MV}.zip"
+            (cd /tmp/susfs/ksu_module_susfs && zip -r9 "$GITHUB_WORKSPACE/$MZIP" . -x '.git*')
+            echo "SUSFS_MODULE_ZIP=$MZIP" >> "$GITHUB_ENV"
+            echo "SUSFS_MODULE_VER=$MV" >> "$GITHUB_ENV"
+            ls -la "$MZIP"
+          fi
           ls -la "$ZIP"
 
       - name: Publish GitHub Release
@@ -450,7 +574,7 @@ jobs:
             echo "- 🔑 **Root:** ${VARIANT_NAME}"
             echo "- 📁 **NoMount:** built in (install the NoMount module after flashing)"
             if [ "$ENABLE_SUSFS" = "true" ]; then
-              echo "- 👻 **SUSFS:** built in (install the SUSFS module after flashing)"
+              echo "- 👻 **SUSFS ${SUSFS_MODULE_VER}:** built in. Flash the attached \`${SUSFS_MODULE_ZIP}\` as a module (other SUSFS modules need a newer kernel SUSFS and will not work)"
             fi
             echo "- ⚙️ **Clang ${CLANG_ID}** · LTO ${LTO}"
             echo "- 🔖 **Commit:** ${{ steps.pack.outputs.short }}"
@@ -458,6 +582,8 @@ jobs:
             echo
             echo "> Flash in recovery. Back up boot first."
           } > notes.txt
-          gh release create "$TAG" "${{ steps.pack.outputs.zip }}" \
+          ASSETS=("${{ steps.pack.outputs.zip }}")
+          if [ -n "${SUSFS_MODULE_ZIP:-}" ] && [ -f "$SUSFS_MODULE_ZIP" ]; then ASSETS+=("$SUSFS_MODULE_ZIP"); fi
+          gh release create "$TAG" "${ASSETS[@]}" \
             --title "Spiteful-Sweet r1.0 · run ${{ github.run_number }}" \
             --notes-file notes.txt
