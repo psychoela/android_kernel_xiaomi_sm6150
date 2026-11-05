@@ -306,15 +306,41 @@ jobs:
           echo "SUSFS_DESC=simonpunk/susfs4ksu kernel-4.14 @ $(git -C /tmp/susfs rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
-        timeout-minutes: 15
+        timeout-minutes: 25
         run: |
-          # the runner's default Ubuntu mirror sometimes hangs; fail fast and retry instead of burning the whole job timeout
-          APT="sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20"
-          for i in 1 2 3; do $APT update && break || { echo "apt update failed (try $i)"; sleep 10; }; done
-          $APT install -y --no-install-recommends \
-            bc bison flex libssl-dev libelf-dev cpio zip unzip lz4 xz-utils \
-            python3 device-tree-compiler make gcc \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+          # The Azure Ubuntu mirror can dribble data at a crawl: the per-file timeout never fires, so a single
+          # apt run used to eat the whole step timeout. Cap each attempt (apt resumes partial downloads on
+          # the next try) and fall back to archive.ubuntu.com after the second failed attempt.
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=60)
+          PKGS=(bc bison flex libssl-dev libelf-dev cpio zip unzip lz4 xz-utils
+                python3 device-tree-compiler make gcc
+                gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi)
+          apt_update() {
+            for i in 1 2 3; do
+              sudo timeout 120 apt-get "${APT_OPTS[@]}" update && return 0
+              echo "apt update failed (try $i)"; sleep 5
+            done
+            return 1
+          }
+          apt_update || true
+          ok=0
+          for attempt in 1 2 3 4; do
+            echo "---- apt install, attempt $attempt ----"
+            if sudo timeout 240 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "${PKGS[@]}"; then
+              ok=1; break
+            fi
+            echo "attempt $attempt failed or stalled"
+            if [ "$attempt" -eq 2 ]; then
+              echo "---- switching to archive.ubuntu.com ----"
+              printf 'http://archive.ubuntu.com/ubuntu/\n' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+              sudo find /etc/apt -name '*.sources' -o -name 'sources.list' | xargs -r sudo sed -i \
+                -E 's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#http://archive.ubuntu.com/ubuntu/#g'
+              apt_update || true
+            fi
+            sleep 5
+          done
+          [ "$ok" = 1 ] || { echo "::error::could not install build dependencies after 4 attempts"; exit 1; }
+          command -v aarch64-linux-gnu-gcc && command -v arm-linux-gnueabi-gcc
 
       - name: Restore Clang cache
         id: clang-cache
