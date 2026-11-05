@@ -610,6 +610,18 @@ jobs:
           } > notes.txt
           ASSETS=("${{ steps.pack.outputs.zip }}")
           if [ -n "${SUSFS_MODULE_ZIP:-}" ] && [ -f "$SUSFS_MODULE_ZIP" ]; then ASSETS+=("$SUSFS_MODULE_ZIP"); fi
-          gh release create "$TAG" "${ASSETS[@]}" \
-            --title "Spiteful-Sweet r1.0 · run ${{ github.run_number }}" \
-            --notes-file notes.txt
+          # GitHub's API occasionally answers HTTP 5xx; the build takes ~40 min, so retry instead of losing it.
+          # If an earlier attempt already created the release, only (re)upload the assets.
+          for i in 1 2 3 4 5 6; do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" "${ASSETS[@]}" --clobber && { echo "release $TAG ready"; exit 0; }
+            else
+              gh release create "$TAG" "${ASSETS[@]}" \
+                --title "Spiteful-Sweet r1.0 · run ${{ github.run_number }}" \
+                --notes-file notes.txt && { echo "release $TAG created"; exit 0; }
+            fi
+            echo "release attempt $i failed; retrying in $((i*20))s"
+            sleep $((i*20))
+          done
+          echo "::error::could not publish the GitHub release after 6 attempts"
+          exit 1
