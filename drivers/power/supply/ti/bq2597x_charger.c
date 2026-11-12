@@ -2055,6 +2055,7 @@ static int bq2597x_charger_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CP_VBAT_CALIBRATE:
 		val->intval = bq->vbat_calibrate;
+		break;
 	default:
 		return -EINVAL;
 
@@ -2251,7 +2252,7 @@ static int bq2597x_check_vbus_error_status(struct bq2597x *bq)
 
 	ret = bq2597x_read_byte(bq, BQ2597X_REG_0A, &stat);
 	if (!ret) {
-		bq_info("BQ2597X_REG_0A:0x%02x\n", stat);
+		pr_debug("BQ2597X_REG_0A:0x%02x\n", stat);
 		if (stat & VBUS_ERROR_LOW_MASK)
 			return VBUS_ERROR_LOW;
 		else if (stat & VBUS_ERROR_HIGH_MASK)

@@ -76,8 +76,7 @@ void cass_cpu_util(struct cass_cpu_cand *c, int this_cpu, bool sync)
 static __always_inline
 bool cass_cpu_better(const struct cass_cpu_cand *a,
 		     const struct cass_cpu_cand *b, unsigned long p_util,
-		     int this_cpu, int prev_cpu, int prev_llc_id, bool sync,
-		     unsigned int *nr_cands)
+		     int this_cpu, int prev_cpu, bool sync)
 {
 #define cass_cmp(a, b) ({ res = (a) - (b); })
 #define cass_eq(a, b) ({ res = (a) == (b); })
@@ -106,15 +105,9 @@ bool cass_cpu_better(const struct cass_cpu_cand *a,
 	if (cass_cmp(!!a->exit_lat, !!b->exit_lat))
 		goto done;
 
-	if (sync) {
-		/* Prefer the current CPU for sync wakes */
-		if (cass_eq(a->cpu, this_cpu))
-			goto done;
-		if (b->cpu == this_cpu) {
-			res = -1; /* Explicitly mark 'b' as winner to avoid res=0 tie */
-			goto done;
-		}
-	}
+	/* Prefer the current CPU for sync wakes */
+	if (sync && (cass_eq(a->cpu, this_cpu) || !cass_cmp(b->cpu, this_cpu)))
+		goto done;
 
 	/* Prefer the CPU with higher capacity */
 	if (cass_cmp(a->cap, b->cap))
@@ -124,39 +117,19 @@ bool cass_cpu_better(const struct cass_cpu_cand *a,
 	if (cass_cmp(b->exit_lat, a->exit_lat))
 		goto done;
 
-	if (cass_eq(a->cpu, prev_cpu))
+	/* Prefer the previous CPU */
+	if (cass_eq(a->cpu, prev_cpu) || !cass_cmp(b->cpu, prev_cpu))
 		goto done;
-	if (b->cpu == prev_cpu) {
-		res = -1; /* Explicitly mark 'b' as winner to avoid res=0 tie */
-		goto done;
-	}
 
-	if (prev_llc_id >= 0) {
-		/* Prefer the CPU that shares a cache with the previous CPU. */
-		if (cass_cmp(per_cpu(sd_llc_id, a->cpu) == prev_llc_id,
-			     per_cpu(sd_llc_id, b->cpu) == prev_llc_id))
-			goto done;
-	} else {
-		/*
-		 * LLC spans all CPUs (DynamIQ). Clear the residual 'res' value
-		 * from the previous CPU check so perfect ties evaluate to 0.
-		 */
-		res = 0;
-	}
+	/* Prefer the CPU that shares a cache with the previous CPU */
+	if (cass_cmp(cpus_share_cache(a->cpu, prev_cpu),
+		     cpus_share_cache(b->cpu, prev_cpu)))
+		goto done;
 
 	/* @a isn't a better CPU than @b. @res must be <=0 to indicate such. */
 done:
-	/* Strictly better candidate found, reset the reservoir counter */
-	if (res > 0) {
-		*nr_cands = 1;
-		return true;
-	}
-
-	/* Perfect tie, apply reservoir sampling for a 1/N chance to swap */
-	if (res == 0 && !reciprocal_scale(sched_rng(), ++(*nr_cands)))
-		return true;
-
-	return false;
+	/* @a is a better CPU than @b if @res is positive */
+	return res > 0;
 }
 
 static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt)
@@ -164,10 +137,9 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 	/* Initialize @best such that @best always has a valid CPU at the end */
 	struct cass_cpu_cand cands[2], *best = cands;
 	int this_cpu = raw_smp_processor_id();
-	unsigned int nr_cands = 1;
 	unsigned long p_util, uc_min;
 	bool has_idle = false;
-	int cidx = 0, cpu, prev_llc_id;
+	int cidx = 0, cpu;
 
 	/*
 	 * Get the utilization and uclamp minimum threshold for this task. Note
@@ -175,22 +147,6 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 	 */
 	p_util = rt ? 0 : task_util_est(p);
 	uc_min = uclamp_eff_value(p, UCLAMP_MIN);
-
-	/*
-	 * When the LLC spans all CPUs (e.g. DynamIQ), every candidate shares
-	 * the cache with prev_cpu and the comparison can never produce a winner.
-	 * When sched domains are torn down, sd_llc_id holds stale values. We
-	 * identify this by making sd_llc RCU-safe. There is no need of rcu_read_lock()
-	 * here since this is a non-preemptible context.
-	 *
-	 * In such scenarios, set prev_llc_id to -1 so that cass_cpu_better() skips
-	 * the check entirely, avoiding unnecessary per_cpu() reads in the hot-path.
-	 */
-	if (unlikely(!rcu_dereference(per_cpu(sd_llc, prev_cpu))) ||
-	    per_cpu(sd_llc_size, prev_cpu) >= nr_cpu_ids)
-		prev_llc_id = -1;
-	else
-		prev_llc_id = per_cpu(sd_llc_id, prev_cpu);
 
 	/*
 	 * Find the best CPU to wake @p on. Although idle_get_state() requires
@@ -297,8 +253,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		 * cidx still needs to be changed to the other candidate slot.
 		 */
 		if (best == curr ||
-		    cass_cpu_better(curr, best, p_util, this_cpu, prev_cpu,
-				    prev_llc_id, sync, &nr_cands)) {
+		    cass_cpu_better(curr, best, p_util, this_cpu, prev_cpu, sync)) {
 			best = curr;
 			cidx ^= 1;
 		}
