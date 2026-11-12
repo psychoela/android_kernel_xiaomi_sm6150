@@ -679,10 +679,8 @@ static int cpuidle_latency_notify(struct notifier_block *b,
 {
 	unsigned long cpus = atomic_read(&idled) & *cpumask_bits(to_cpumask(v));
 
-	if (!lpm_sleep_disabled()) {
-		if (cpus)
-			smp_send_ipi(to_cpumask(&cpus));
-	}
+	if (cpus)
+		smp_send_ipi(to_cpumask(&cpus));
 
 	return NOTIFY_OK;
 }

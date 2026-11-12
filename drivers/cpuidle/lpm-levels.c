@@ -52,10 +52,6 @@
 #include "../../drivers/clk/msm/clock.h"
 #endif /* CONFIG_COMMON_CLK */
 #include "../../kernel/sched/sched.h"
-#ifdef CONFIG_DRM_PANEL
-#include <linux/fb.h>
-#include <linux/msm_drm_notify.h>
-#endif
 #define CREATE_TRACE_POINTS
 #include <trace/events/trace_msm_low_power.h>
 
@@ -111,50 +107,8 @@ static void cluster_prepare(struct lpm_cluster *cluster,
 static bool print_parsed_dt;
 module_param_named(print_parsed_dt, print_parsed_dt, bool, 0664);
 
-#ifdef CONFIG_DRM_PANEL
-static bool sleep_disabled = true;
-module_param_named(sleep_disabled, sleep_disabled, bool, 0444);
-static int lpm_drm_panel_notify(struct notifier_block *nb,
-		unsigned long val, void *ptr)
-{
-	struct fb_event *evdata = ptr;
-	unsigned int blank;
-
-	if (!evdata || !evdata->data || val != MSM_DRM_EVENT_BLANK)
-		return 0;
-
-	blank = *(int *)(evdata->data);
-	switch (blank) {
-	case MSM_DRM_BLANK_UNBLANK:
-		sleep_disabled = true;
-		wake_up_all_idle_cpus();
-		break;
-	case MSM_DRM_BLANK_LP1:
-	case MSM_DRM_BLANK_LP2:
-	case MSM_DRM_BLANK_STANDBY:
-	case MSM_DRM_BLANK_SUSPEND:
-	case MSM_DRM_BLANK_POWERDOWN:
-		sleep_disabled = false;
-		wake_up_all_idle_cpus();
-		break;
-	default:
-		break;
-	};
-	return NOTIFY_OK;
-}
-static struct notifier_block drm_notifier = {
-	.notifier_call = lpm_drm_panel_notify,
-};
-#else
 static bool sleep_disabled;
 module_param_named(sleep_disabled, sleep_disabled, bool, 0664);
-#endif
-
-bool lpm_sleep_disabled(void)
-{
-	return sleep_disabled;
-}
-EXPORT_SYMBOL(lpm_sleep_disabled);
 
 /**
  * msm_cpuidle_get_deep_idle_latency - Get deep idle latency value
@@ -667,11 +621,13 @@ static inline bool is_cpu_biased(int cpu, uint64_t *bias_time)
 }
 
 static int cpu_power_select(struct cpuidle_device *dev,
-		struct lpm_cpu *cpu, s64 sleep_us)
+		struct lpm_cpu *cpu)
 {
 	int best_level = 0;
 	uint32_t latency_us = pm_qos_request_for_cpu(PM_QOS_CPU_DMA_LATENCY,
 							dev->cpu);
+	ktime_t delta_next;
+	s64 sleep_us = ktime_to_us(tick_nohz_get_sleep_length(&delta_next));
 	uint32_t modified_time_us = 0;
 	uint32_t next_event_us = 0;
 	int i, idx_restrict;
@@ -1406,15 +1362,11 @@ static int lpm_cpuidle_select(struct cpuidle_driver *drv,
 		struct cpuidle_device *dev, bool *stop_tick)
 {
 	struct lpm_cpu *cpu = per_cpu(cpu_lpm, dev->cpu);
-	ktime_t delta_next;
-	ktime_t duration = tick_nohz_get_sleep_length(&delta_next);
-	if (duration <= TICK_NSEC)
-		*stop_tick = false;
 
 	if (!cpu)
 		return 0;
 
-	return cpu_power_select(dev, cpu, ktime_to_us(duration));
+	return cpu_power_select(dev, cpu);
 }
 
 void update_ipi_history(int cpu)
@@ -1785,14 +1737,6 @@ static int lpm_probe(struct platform_device *pdev)
 	unsigned int cpu;
 	struct hrtimer *cpu_histtimer;
 	struct kobject *module_kobj = NULL;
-
-#ifdef CONFIG_DRM_PANEL
-	ret = msm_drm_register_client(&drm_notifier);
-	if (ret)
-		pr_err("Failed to register drm panel notifier: %d\n", ret);
-	else
-		pr_info("Registered drm panel notifier\n");
-#endif
 
 	get_online_cpus();
 	lpm_root_node = lpm_of_parse_cluster(pdev);
