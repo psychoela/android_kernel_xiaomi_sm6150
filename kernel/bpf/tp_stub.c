@@ -1,24 +1,34 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Minimal stub to register BPF_PROG_TYPE_TRACEPOINT without the full
- * tracing infrastructure (CONFIG_FTRACE/CONFIG_BPF_EVENTS).
- *
- * gpuMem.bpf only uses map helpers (lookup/update/delete) which are
- * handled by the core BPF verifier — no tracing-specific helpers needed.
+ * Minimal bpf stub 
  */
 
 #include <linux/bpf.h>
 #include <linux/filter.h>
-#include <linux/mutex.h>
-#include <linux/rcupdate.h>
-#include <linux/string.h>
-#include <linux/tracepoint-defs.h>
-
-#define CREATE_TRACE_POINTS
+#include <linux/btf.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <trace/events/sched.h>
+#include <trace/events/vmscan.h>
+#include <trace/events/oom.h>
+#include <trace/events/power.h>
 #include <trace/events/gpu_mem.h>
 
+/* Export tracepoint symbols for BPF programs */
+EXPORT_TRACEPOINT_SYMBOL(sched_process_exit);
+EXPORT_TRACEPOINT_SYMBOL(sched_process_fork);
+EXPORT_TRACEPOINT_SYMBOL(sched_switch);
+EXPORT_TRACEPOINT_SYMBOL(vmscan_mm_vmscan_direct_reclaim_begin);
+EXPORT_TRACEPOINT_SYMBOL(vmscan_mm_vmscan_direct_reclaim_end);
+EXPORT_TRACEPOINT_SYMBOL(vmscan_mm_vmscan_kswapd_sleep);
+EXPORT_TRACEPOINT_SYMBOL(vmscan_mm_vmscan_kswapd_wake);
+EXPORT_TRACEPOINT_SYMBOL(oom_mark_victim);
+EXPORT_TRACEPOINT_SYMBOL(power_cpu_frequency);
+EXPORT_TRACEPOINT_SYMBOL(power_cpu_frequency_limits);
+EXPORT_TRACEPOINT_SYMBOL(scheduler_sched_cpu_util);
 EXPORT_TRACEPOINT_SYMBOL(gpu_mem_total);
 
+/* Weak symbols for optional tracepoints */
 const struct bpf_func_proto * __weak bpf_tracing_func_proto(
 	enum bpf_func_id func_id, const struct bpf_prog *prog)
 {
@@ -31,18 +41,19 @@ const struct bpf_func_proto * __weak tracing_prog_func_proto(
 	return NULL;
 }
 
+/* Base function proto for all stub program types */
 static const struct bpf_func_proto *
 tp_stub_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 {
 	return bpf_base_func_proto(func_id);
 }
 
+/* Base access check for all stub program types */
 static bool tp_stub_is_valid_access(int off, int size,
 				    enum bpf_access_type type,
 				    const struct bpf_prog *prog,
 				    struct bpf_insn_access_aux *info)
 {
-	/* Tracepoint ctx is a pointer to raw args — allow any aligned read */
 	if (type != BPF_READ)
 		return false;
 	if (off < 0 || off + size > 2048)
@@ -52,6 +63,11 @@ static bool tp_stub_is_valid_access(int off, int size,
 	return true;
 }
 
+/* ============================================================
+ * Verifier ops for BPF program types NOT in net/core/filter.c
+ * ============================================================ */
+
+/* Tracepoint programs */
 const struct bpf_verifier_ops tracepoint_verifier_ops = {
 	.get_func_proto  = tp_stub_func_proto,
 	.is_valid_access = tp_stub_is_valid_access,
@@ -60,6 +76,7 @@ const struct bpf_verifier_ops tracepoint_verifier_ops = {
 const struct bpf_prog_ops tracepoint_prog_ops = {
 };
 
+/* Raw tracepoint programs */
 const struct bpf_verifier_ops raw_tracepoint_verifier_ops = {
 	.get_func_proto  = tp_stub_func_proto,
 	.is_valid_access = tp_stub_is_valid_access,
@@ -68,6 +85,7 @@ const struct bpf_verifier_ops raw_tracepoint_verifier_ops = {
 const struct bpf_prog_ops raw_tracepoint_prog_ops = {
 };
 
+/* Raw tracepoint writable programs */
 const struct bpf_verifier_ops raw_tracepoint_writable_verifier_ops = {
 	.get_func_proto  = tp_stub_func_proto,
 	.is_valid_access = tp_stub_is_valid_access,
@@ -76,6 +94,7 @@ const struct bpf_verifier_ops raw_tracepoint_writable_verifier_ops = {
 const struct bpf_prog_ops raw_tracepoint_writable_prog_ops = {
 };
 
+/* Tracing programs (kprobe, uprobe, etc.) */
 const struct bpf_verifier_ops tracing_verifier_ops = {
 	.get_func_proto  = tp_stub_func_proto,
 	.is_valid_access = tp_stub_is_valid_access,
@@ -84,99 +103,146 @@ const struct bpf_verifier_ops tracing_verifier_ops = {
 const struct bpf_prog_ops tracing_prog_ops = {
 };
 
-/*
- * Virtual raw tracepoints.
- *
- * bpf_raw_tracepoint_open() in kernel/bpf/syscall.c resolves the target
- * tracepoint through bpf_get_raw_tracepoint() and attaches through
- * bpf_probe_register().  With the full tracing stack disabled there are
- * no real tracepoints (CONFIG_TRACEPOINTS off means every TRACE_EVENT is
- * compiled out), so every attach currently dies with -ENOENT and userspace
- * (gpuMem/gpuWork) logs "Failed to attach bpf program".  Harmless, but
- * noisy.
- *
- * Instead we advertise a tiny fixed set of virtual raw tracepoints.
- * Attaching succeeds, the bpf link stays alive and valid (fdinfo, link
- * info and unregister all work), so userspace is happy.  The underlying
- * tracepoint can never fire in this configuration, so the attached
- * program simply never runs and its maps stay at their zeroed defaults.
- */
-struct tp_evict {
-	struct bpf_raw_event_map	map;
-	struct bpf_prog		*prog;
+/* Kprobe programs */
+const struct bpf_verifier_ops kprobe_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
 };
 
-static const char tp_name_gpu_mem_total[] = "gpu_mem/gpu_mem_total";
-static const char tp_name_gpu_work_period[] = "power/gpu_work_period";
-
-static struct tracepoint tp_gpu_mem_total = {
-	.name = tp_name_gpu_mem_total,
+const struct bpf_prog_ops kprobe_prog_ops = {
 };
 
-static struct tracepoint tp_gpu_work_period = {
-	.name = tp_name_gpu_work_period,
+/* Uprobe programs */
+const struct bpf_verifier_ops uprobe_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
 };
 
-static struct tp_evict tp_evicts[] = {
-	[0] = {
-		.map = {
-			.tp	     = &tp_gpu_mem_total,
-			.num_args   = 4,
-		},
-	},
-	[1] = {
-		.map = {
-			.tp	     = &tp_gpu_work_period,
-			.num_args   = 4,
-		},
-	},
+const struct bpf_prog_ops uprobe_prog_ops = {
 };
 
-static DEFINE_MUTEX(tp_stub_mutex);
+/* Cgroup sysctl programs */
+const struct bpf_verifier_ops cgroup_sysctl_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
+};
 
-struct bpf_raw_event_map *bpf_get_raw_tracepoint(const char *name)
-{
-	struct tp_evict *ev;
-	int i;
+const struct bpf_prog_ops cgroup_sysctl_prog_ops = {
+};
 
-	for (i = 0; i < ARRAY_SIZE(tp_evicts); i++) {
-		ev = &tp_evicts[i];
-		if (!strcmp(ev->map.tp->name, name))
-			return &ev->map;
-	}
-	return NULL;
-}
+/* Cgroup device programs */
+const struct bpf_verifier_ops cgroup_device_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
+};
 
-void bpf_put_raw_tracepoint(struct bpf_raw_event_map *map)
-{
-	/* no module backing for virtual tracepoints */
-}
+const struct bpf_prog_ops cgroup_device_prog_ops = {
+};
 
-int bpf_probe_register(struct bpf_raw_event_map *map, struct bpf_prog *prog)
-{
-	struct tp_evict *ev;
+/* Struct ops programs */
+const struct bpf_verifier_ops struct_ops_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
+};
 
-	/* mirror bpf_trace.c bounds checks */
-	if (prog->aux->max_ctx_offset > map->num_args * sizeof(u64))
-		return -EINVAL;
-	if (prog->aux->max_tp_access > map->writable_size)
-		return -EINVAL;
+const struct bpf_prog_ops struct_ops_prog_ops = {
+};
 
-	mutex_lock(&tp_stub_mutex);
-	ev = container_of(map, struct tp_evict, map);
-	ev->prog = prog;
-	mutex_unlock(&tp_stub_mutex);
-	return 0;
-}
+/* LSM programs */
+const struct bpf_verifier_ops lsm_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
+};
 
-int bpf_probe_unregister(struct bpf_raw_event_map *map, struct bpf_prog *prog)
-{
-	struct tp_evict *ev;
+const struct bpf_prog_ops lsm_prog_ops = {
+};
 
-	mutex_lock(&tp_stub_mutex);
-	ev = container_of(map, struct tp_evict, map);
-	if (ev->prog == prog)
-		ev->prog = NULL;
-	mutex_unlock(&tp_stub_mutex);
-	return 0;
-}
+/* CGROUP_SOCKOPT programs */
+const struct bpf_verifier_ops cgroup_sockopt_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
+};
+
+const struct bpf_prog_ops cgroup_sockopt_prog_ops = {
+};
+
+/* CGROUP_GETSOCKOPT programs */
+const struct bpf_verifier_ops cgroup_getsockopt_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
+};
+
+const struct bpf_prog_ops cgroup_getsockopt_prog_ops = {
+};
+
+/* CGROUP_BIND programs */
+const struct bpf_verifier_ops cgroup_bind_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
+};
+
+const struct bpf_prog_ops cgroup_bind_prog_ops = {
+};
+
+/* CGROUP_CONNECT programs */
+const struct bpf_verifier_ops cgroup_connect_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
+};
+
+const struct bpf_prog_ops cgroup_connect_prog_ops = {
+};
+
+/* CGROUP_SENDMSG programs */
+const struct bpf_verifier_ops cgroup_sendmsg_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
+};
+
+const struct bpf_prog_ops cgroup_sendmsg_prog_ops = {
+};
+
+/* CGROUP_RECVMSG programs */
+const struct bpf_verifier_ops cgroup_recvmsg_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
+};
+
+const struct bpf_prog_ops cgroup_recvmsg_prog_ops = {
+};
+
+/* CGROUP_GETPEERNAME programs */
+const struct bpf_verifier_ops cgroup_getpeername_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
+};
+
+const struct bpf_prog_ops cgroup_getpeername_prog_ops = {
+};
+
+/* CGROUP_GETSOCKNAME programs */
+const struct bpf_verifier_ops cgroup_getsockname_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
+};
+
+const struct bpf_prog_ops cgroup_getsockname_prog_ops = {
+};
+
+/* SK_RELEASE programs */
+const struct bpf_verifier_ops sk_release_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
+};
+
+const struct bpf_prog_ops sk_release_prog_ops = {
+};
+
+/* EXT programs */
+const struct bpf_verifier_ops ext_verifier_ops = {
+	.get_func_proto  = tp_stub_func_proto,
+	.is_valid_access = tp_stub_is_valid_access,
+};
+
+const struct bpf_prog_ops ext_prog_ops = {
+};
