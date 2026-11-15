@@ -113,8 +113,9 @@ jobs:
         run: |
           set -e
           NM_REF="${IN_NM_REF:-master}"
-          curl -fsSL "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/${NM_REF}/kernel/setup.sh" -o /tmp/nm_setup.sh \
-            || { echo "::error::could not download kernel/setup.sh from branch '${NM_REF}' of maxsteeel/nomount"; exit 1; }
+          # raw.githubusercontent.com accepts a branch, a tag or a commit SHA here
+          curl -fsSL "https://raw.githubusercontent.com/maxsteeel/nomount/${NM_REF}/kernel/setup.sh" -o /tmp/nm_setup.sh \
+            || { echo "::error::could not download kernel/setup.sh for ref '${NM_REF}' of maxsteeel/nomount (not a branch, tag or commit?)"; exit 1; }
           echo "---- setup.sh (first 60 lines) ----"
           head -60 /tmp/nm_setup.sh
           echo "---- running it at the kernel tree root ----"
@@ -124,7 +125,11 @@ jobs:
           grep -n "nomount" fs/Kconfig fs/Makefile || true
           echo "---- fs/nomount/Kconfig ----"
           cat fs/nomount/Kconfig 2>/dev/null | head -40 || true
-          echo "NM_DESC=maxsteeel/nomount branch ${NM_REF}" >> "$GITHUB_ENV"
+          NM_SHA="$(git -C NoMount rev-parse --short HEAD 2>/dev/null || echo '?')"
+          NM_CNT="$(git -C NoMount rev-list --count HEAD 2>/dev/null || echo '?')"
+          NM_VER="$(grep -rhoE 'NOMOUNT_BASE_VERSION[[:space:]]+"?[0-9]+"?' fs/nomount/ 2>/dev/null | head -1 || true)"
+          echo "NoMount: ref=${NM_REF} sha=${NM_SHA} commits=${NM_CNT} ${NM_VER}"
+          echo "NM_DESC=maxsteeel/nomount ${NM_REF} @ ${NM_SHA} (${NM_CNT} commits)" >> "$GITHUB_ENV"
 
       # The kernel tree was prepared for KernelSU-Next (legacy). backslashxx/KernelSU uses the
       # "scope-minimized manual hooks" layout (backslashxx/KernelSU#5), which differs in two places:
