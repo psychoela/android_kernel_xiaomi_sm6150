@@ -130,6 +130,15 @@ jobs:
           NM_VER="$(grep -rhoE 'NOMOUNT_BASE_VERSION[[:space:]]+"?[0-9]+"?' fs/nomount/ 2>/dev/null | head -1 || true)"
           echo "NoMount: ref=${NM_REF} sha=${NM_SHA} commits=${NM_CNT} ${NM_VER}"
           echo "NM_DESC=maxsteeel/nomount ${NM_REF} @ ${NM_SHA} (${NM_CNT} commits)" >> "$GITHUB_ENV"
+          # Diagnostic: which branch/tag of maxsteeel/nomount carries which NOMOUNT_BASE_VERSION
+          echo "---- NoMount NOMOUNT_BASE_VERSION per branch/tag ----"
+          git -C NoMount fetch --quiet --tags origin '+refs/heads/*:refs/remotes/origin/*' 2>/dev/null || true
+          for r in $(git -C NoMount for-each-ref --format='%(refname:short)' refs/remotes/origin refs/tags | grep -v '/HEAD$'); do
+            v="$(git -C NoMount grep -h -o -E 'NOMOUNT_BASE_VERSION[[:space:]]+"?[0-9]+"?' "$r" -- kernel 2>/dev/null | head -1 || true)"
+            c="$(git -C NoMount rev-list --count "$r" 2>/dev/null || echo '?')"
+            echo "$r  commits=$c  ${v:-n/a}"
+          done || true
+          echo "---- end ----"
 
       # The kernel tree was prepared for KernelSU-Next (legacy). backslashxx/KernelSU uses the
       # "scope-minimized manual hooks" layout (backslashxx/KernelSU#5), which differs in two places:
