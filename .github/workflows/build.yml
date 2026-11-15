@@ -120,8 +120,18 @@ jobs:
           head -60 /tmp/nm_setup.sh
           echo "---- running it at the kernel tree root ----"
           bash /tmp/nm_setup.sh "$NM_REF"
+          # setup.sh only creates the fs/nomount -> NoMount/kernel/src link when fs/nomount does not exist
+          # yet. This kernel tree already ships a vendored (older) fs/nomount directory, so the link ended
+          # up inside it as fs/nomount/src and the OLD vendored code kept being compiled (driver stayed 22
+          # whatever nomount_ref was). Replace the vendored copy with the freshly fetched sources.
+          if [ ! -L fs/nomount ]; then
+            echo "fs/nomount is a vendored directory: replacing it with a link to NoMount/kernel/src"
+            ls -la fs/nomount/ || true
+            rm -rf fs/nomount
+            ln -s ../NoMount/kernel/src fs/nomount
+          fi
           test -d fs/nomount || { echo "::error::fs/nomount was not created by setup.sh"; git status --short | head -30; exit 1; }
-          ls -la fs/nomount
+          ls -la fs/nomount fs/nomount/
           grep -n "nomount" fs/Kconfig fs/Makefile || true
           echo "---- fs/nomount/Kconfig ----"
           cat fs/nomount/Kconfig 2>/dev/null | head -40 || true
