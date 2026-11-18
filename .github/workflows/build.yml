@@ -399,8 +399,8 @@ jobs:
       - name: Configure kernel
         run: |
           make O=out ARCH=arm64 "$DEFCONFIG"
-          # Kernel name shown in Settings / KernelSU: 4.14.357-Spiteful-Sweet/KSU-r1.0
-          scripts/config --file out/.config --set-str LOCALVERSION "-Spiteful-Sweet/KSU-r1.0" -d LOCALVERSION_AUTO
+          # Kernel name shown in Settings: Google ACK style, 4.14.357-g<hash>
+          scripts/config --file out/.config --set-str LOCALVERSION "-g$(git rev-parse --short=12 HEAD)" -d LOCALVERSION_AUTO
           # Helper: read the real 'depends on' chain of a config symbol (default KSU, or NOMOUNT) from the
           # Kconfig files in this tree and switch it all on.
           cat > /tmp/ksu_deps.py <<'PY'
