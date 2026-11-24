@@ -823,6 +823,9 @@ struct task_struct {
 	 */
 	int				recent_used_cpu;
 	int				wake_cpu;
+	/* CPU charged while in_iowait. */
+	int				iowait_cpu;
+	int				iowait_started;
 #endif
 	int				on_rq;
 
@@ -1387,7 +1390,7 @@ struct task_struct {
 	atomic_t			tracing_graph_pause;
 #endif
 
-#ifdef CONFIG_TRACING
+#if defined(CONFIG_TRACING) || defined(CONFIG_STRIPPED_BPF_TRACE)
 	/* State flags for use by tracers: */
 	unsigned long			trace;
 

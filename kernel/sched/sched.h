@@ -1710,6 +1710,13 @@ static inline struct task_group *task_group(struct task_struct *p)
 	return p->sched_task_group;
 }
 
+#ifdef CONFIG_FAIR_GROUP_SCHED
+struct cfs_tg_state {
+	struct cfs_rq		cfs_rq;
+	struct sched_entity	se;
+} __no_randomize_layout;
+#endif
+
 /* Change a task's cfs_rq and parent entity if it moves across CPUs/groups */
 static inline void set_task_rq(struct task_struct *p, unsigned int cpu)
 {
@@ -1802,7 +1809,7 @@ static inline int task_running(struct rq *rq, struct task_struct *p)
 
 static inline int task_on_rq_queued(struct task_struct *p)
 {
-	return p->on_rq == TASK_ON_RQ_QUEUED;
+	return READ_ONCE(p->on_rq) == TASK_ON_RQ_QUEUED;
 }
 
 static inline int task_on_rq_migrating(struct task_struct *p)
@@ -2196,11 +2203,6 @@ static inline void __block_task(struct rq *rq, struct task_struct *p)
 {
 	if (p->sched_contributes_to_load)
 		rq->nr_uninterruptible++;
-
-	if (p->in_iowait) {
-		atomic_inc(&rq->nr_iowait);
-		delayacct_blkio_start();
-	}
 
 	/*
 	 * The moment this write goes through, ttwu() can swoop in and migrate
