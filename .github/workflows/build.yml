@@ -6,7 +6,8 @@ name: build
 #
 # Root solution: Baka-SU/BakaSU (KernelSU downstream, formerly ReSukiSU) in MANUAL HOOK mode,
 # cloned at build time and wired in as drivers/kernelsu, plus NoMount (maxsteeel/nomount) integrated
-# into the kernel source with its setup.sh. No SUSFS for now.
+# into the kernel source with its setup.sh. SUSFS is optional (manual run, enable_susfs): BakaSU's
+# "SUSFS Inline Hook" mode + the 4.14 non-GKI SUSFS backport from JackA1ltman/NonGKI_Kernel_Build_2nd.
 # The kernel tree's existing manual hooks (fs/exec.c, fs/open.c, ...) are used as they are, and
 # BakaSU checks at compile time that every required hook exists: if one is missing the build log
 # names it (see https://bakasu.org/guide/manual-integrate).
@@ -33,9 +34,13 @@ on:
         type: boolean
         default: false
       enable_susfs:
-        description: "EXPERIMENTAL: build with SUSFS (switches root to tiann/KernelSU, needs the official v0.9.5 manager). Off = BakaSU + NoMount"
+        description: "EXPERIMENTAL: build BakaSU with SUSFS (SUSFS Inline Hook mode instead of Manual Hook). Off = BakaSU manual hooks + NoMount"
         type: boolean
         default: false
+      susfs_ref:
+        description: "JackA1ltman/NonGKI_Kernel_Build_2nd ref that carries the 4.14 SUSFS patch (default = pinned commit, SUSFS v2.4.0)"
+        type: string
+        default: ec069a4e34f992d602a6b40d2e211df2516e2865
 
 permissions:
   contents: write
@@ -48,8 +53,8 @@ env:
   CLANG_ID: r563880c
   KBUILD_BUILD_USER: PsychoAvy
   KBUILD_BUILD_HOST: github
-  # SUSFS is OFF for push builds (BakaSU + NoMount); it is only built when a manual
-  # run ticks enable_susfs, which switches the root solution to tiann/KernelSU (see "Fetch KernelSU")
+  # SUSFS is OFF for push builds (BakaSU manual hooks + NoMount); it is only built when a manual
+  # run ticks enable_susfs, which switches BakaSU to its SUSFS Inline Hook mode
   ENABLE_SUSFS: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_susfs }}
 
 jobs:
@@ -71,14 +76,7 @@ jobs:
         run: |
           set -e
           REF="${IN_KSU_REF:-latest}"
-          if [ "$ENABLE_SUSFS" = "true" ]; then
-            # SUSFS: the kernel-4.14 SUSFS patch is written against tiann/KernelSU from late May 2024
-            # (non-GKI support still present). bd5100d6 is the closest commit (only 1 hunk needs porting).
-            KSU_REPO="tiann/KernelSU"
-            [ "$REF" = "latest" ] && REF="bd5100d6"
-          else
-            KSU_REPO="Baka-SU/BakaSU"
-          fi
+          KSU_REPO="Baka-SU/BakaSU"
           # keep this a full clone: BakaSU's Kbuild derives its version from git history
           git clone --quiet "https://github.com/${KSU_REPO}" KernelSU
           echo "---- branches ----"
@@ -99,9 +97,9 @@ jobs:
           echo "---- Kconfig of the fork (config names, dependencies, defaults) ----"
           grep -nE "^[[:space:]]*(menu)?config |depends on|default|select|prompt|bool|tristate" KernelSU/kernel/Kconfig | head -80
           if [ "$ENABLE_SUSFS" = "true" ]; then
-            echo "VARIANT=susfs" >> "$GITHUB_ENV"
-            echo "VARIANT_NAME=KernelSU ${SHORT} + SUSFS" >> "$GITHUB_ENV"
-            echo "SLUG=susfs" >> "$GITHUB_ENV"
+            echo "VARIANT=bakasu-susfs" >> "$GITHUB_ENV"
+            echo "VARIANT_NAME=BakaSU ${DESC} + SUSFS" >> "$GITHUB_ENV"
+            echo "SLUG=bakasu-susfs" >> "$GITHUB_ENV"
           else
             echo "VARIANT=bakasu" >> "$GITHUB_ENV"
             echo "VARIANT_NAME=BakaSU ${DESC}" >> "$GITHUB_ENV"
@@ -160,7 +158,8 @@ jobs:
       #     The legacy blocks are stripped from the tree so they cannot clash; weak stubs for the two
       #     read symbols stay as a safety net so the link succeeds either way.
       #  2. fs/stat.c needs the newfstat return hook, otherwise init never sees the enlarged init.rc
-      #     (required on Android 16+, harmless on older).
+      #     (required on Android 16+, harmless on older), plus the fstat64 return hook (32-bit su): BakaSU's
+      #     compile-time check fails the build without it.
       - name: Adapt manual hooks for BakaSU
         if: env.ENABLE_SUSFS != 'true'
         run: |
@@ -232,155 +231,85 @@ jobs:
           import re, sys, pathlib
           p = pathlib.Path("fs/stat.c")
           text = p.read_text()
-          if "ksu_handle_newfstat_ret" in text:
-              print("fs/stat.c: newfstat hook already present")
-              sys.exit(0)
-          m = re.search(r"^SYSCALL_DEFINE2\(newfstat,.*?^\}\n", text, re.S | re.M)
-          if not m:
-              sys.exit("SYSCALL_DEFINE2(newfstat) not found in fs/stat.c")
-          body = m.group(0)
-          if "\treturn error;\n}" not in body:
-              sys.exit("unexpected newfstat body:\n" + body)
-          new = body.replace("\treturn error;\n}",
-              "#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif\n\treturn error;\n}", 1)
-          decl = ("#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-                  "extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);\n"
-                  "#endif\n\n")
-          p.write_text(text[:m.start()] + decl + new + text[m.end():])
-          print("fs/stat.c: newfstat hook added")
+
+          def add_ret_hook(text, syscall, fn, decl, call):
+              if fn in text:
+                  print("fs/stat.c: %s already present" % fn)
+                  return text
+              m = re.search(r"^SYSCALL_DEFINE2\(%s,.*?^\}\n" % syscall, text, re.S | re.M)
+              if not m:
+                  print("::warning::SYSCALL_DEFINE2(%s) not found in fs/stat.c" % syscall)
+                  return text
+              body = m.group(0)
+              if "\treturn error;\n}" not in body:
+                  sys.exit("unexpected %s body:\n%s" % (syscall, body))
+              new = body.replace("\treturn error;\n}",
+                  "#ifdef CONFIG_KSU_MANUAL_HOOK\n\t" + call + "\n#endif\n\treturn error;\n}", 1)
+              pre = "#ifdef CONFIG_KSU_MANUAL_HOOK\n" + decl + "\n#endif\n\n"
+              print("fs/stat.c: %s hook added" % fn)
+              return text[:m.start()] + pre + new + text[m.end():]
+
+          text = add_ret_hook(text, "newfstat", "ksu_handle_newfstat_ret",
+              "extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);",
+              "ksu_handle_newfstat_ret(&fd, &statbuf);")
+          # 32-bit su (compat): BakaSU's compile-time hook check asks for this one too
+          text = add_ret_hook(text, "fstat64", "ksu_handle_fstat64_ret",
+              "extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);",
+              "ksu_handle_fstat64_ret(&fd, &statbuf);")
+          p.write_text(text)
           PY
           git --no-pager diff --stat -- fs/stat.c fs/Makefile fs/read_write.c drivers/input/input.c kernel/sys.c || true
-          grep -n -B3 -A3 "ksu_handle_newfstat_ret" fs/stat.c | head -30
+          grep -n -B3 -A3 "ksu_handle_newfstat_ret\|ksu_handle_fstat64_ret" fs/stat.c | head -60
           echo "---- legacy KSU symbols still referenced in the tree (expect none outside the weak stubs) ----"
           grep -rnE "ksu_vfs_read_hook|ksu_input_hook|ksu_handle_input_handle_event|ksu_handle_vfs_read|ksu_handle_setresuid" fs kernel drivers/input include 2>/dev/null | grep -v ksu_hook_stubs || true
 
-      # EXPERIMENTAL. SUSFS kernel-4.14 patches (simonpunk/susfs4ksu, pinned) + tiann/KernelSU @ bd5100d6.
-      # Known gaps handled here: one KernelSU hunk (selinux.c) and three optional kernel hunks
-      # (task_mmu.c include, sys.c uname spoof, cmdline.c spoof) are ported by small scripts.
-      # Anything else that fails stops the build and prints the rejected hunks.
-      - name: Integrate SUSFS (experimental)
+      # EXPERIMENTAL. SUSFS for BakaSU on Linux 4.14. simonpunk's own kernel-4.14 patch is far older than what
+      # BakaSU's "SUSFS Inline Hook" mode expects, so this uses the non-GKI backport from
+      # JackA1ltman/NonGKI_Kernel_Build_2nd (Patches/Patch/susfs_patch_to_4.14.patch, SUSFS v2.4.0) and the
+      # flow its wiki describes for BakaSU: clean_hook.sh (strip the old KSU hooks) -> BakaSU (set up above)
+      # -> susfs_inline_hook_patches.sh -> susfs patch. BakaSU's manual hooks are not used in this mode
+      # (KSU_SUSFS replaces KSU_MANUAL_HOOK). If anything fails the log lists the files found and the rejects.
+      - name: Integrate SUSFS (BakaSU inline hooks, experimental)
         if: env.ENABLE_SUSFS == 'true'
+        env:
+          IN_SUSFS_REF: ${{ inputs.susfs_ref }}
         run: |
           set -e
-          rm -rf /tmp/susfs
-          git clone --quiet -b kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu /tmp/susfs \
-            || git clone --quiet -b kernel-4.14 https://github.com/kutemeikito/susfs4ksu /tmp/susfs
-          git -C /tmp/susfs checkout -q 77905b5 || echo "::warning::pinned SUSFS commit 77905b5 not found, using branch tip"
-          echo "SUSFS @ $(git -C /tmp/susfs rev-parse --short HEAD)"
-          P=/tmp/susfs/kernel_patches
-          KPATCH="$P/50_add_susfs_in_kernel-4.14.patch"
-          SPATCH="$P/KernelSU/10_enable_susfs_for_ksu.patch"
-          test -f "$KPATCH" || { echo "::error::$KPATCH not found"; exit 1; }
-          test -f "$SPATCH" || { echo "::error::$SPATCH not found"; exit 1; }
-          cp -v "$P"/fs/*.c fs/
-          cp -v "$P"/include/linux/*.h include/linux/
-
-          echo "---- 1/3: KernelSU side patch ----"
-          ( cd KernelSU && patch -p1 --batch --no-backup-if-mismatch < "$SPATCH" ) || true
-          cat > /tmp/ksu_fix.py <<'PY'
-          import pathlib, re, sys
-          # Port the SUSFS hunks that do not apply to backslashxx-free tiann KernelSU: selinux.c.rej
-          rej = pathlib.Path("KernelSU/kernel/selinux/selinux.c.rej")
-          if rej.exists():
-              txt = rej.read_text()
-              add = [l[1:] for l in txt.splitlines() if l.startswith("+") and not l.startswith("+++")]
-              if not add or "susfs_set_sid" not in "\n".join(add):
-                  sys.exit("selinux.c.rej does not look like the expected SUSFS hunk")
-              p = pathlib.Path("KernelSU/kernel/selinux/selinux.c")
-              t = p.read_text()
-              if "susfs_set_sid" not in t:
-                  anchor = "#define DEVPTS_DOMAIN"
-                  i = t.find(anchor)
-                  if i < 0:
-                      sys.exit("anchor '#define DEVPTS_DOMAIN' not found in selinux.c")
-                  t = t[:i] + "\n".join(add) + "\n" + t[i:]
-                  p.write_text(t)
-              rej.unlink()
-              print("selinux.c: ported the rejected SUSFS hunk")
-          PY
-
-          python3 -I /tmp/ksu_fix.py
-          if [ -n "$(find KernelSU -name '*.rej')" ]; then
-            echo "::error::SUSFS KernelSU-side patch has unported rejected hunks"
-            for f in $(find KernelSU -name '*.rej'); do echo "=== $f ==="; cat "$f"; done
+          REF="${IN_SUSFS_REF:-ec069a4e34f992d602a6b40d2e211df2516e2865}"
+          rm -rf /tmp/nongki
+          git clone --quiet https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd /tmp/nongki
+          git -C /tmp/nongki checkout -q "$REF" || { echo "::error::ref '$REF' not found in JackA1ltman/NonGKI_Kernel_Build_2nd"; exit 1; }
+          SUSFS_SHA="$(git -C /tmp/nongki rev-parse --short HEAD)"
+          echo "NonGKI_Kernel_Build_2nd @ $SUSFS_SHA"
+          echo "---- candidate files ----"
+          ( cd /tmp/nongki && find . -path ./.git -prune -o -type f \( -name '*susfs*' -o -name 'clean_hook*' \) -print | sort )
+          find1() { find /tmp/nongki -path /tmp/nongki/.git -prune -o -type f -name "$1" -print | head -1; }
+          PATCH="$(find1 susfs_patch_to_4.14.patch)"
+          HOOKS="$(find1 susfs_inline_hook_patches.sh)"
+          CLEAN="$(find1 clean_hook.sh)"
+          for f in "$PATCH" "$HOOKS" "$CLEAN"; do
+            [ -n "$f" ] || { echo "::error::susfs_patch_to_4.14.patch / susfs_inline_hook_patches.sh / clean_hook.sh not all found in NonGKI_Kernel_Build_2nd @ $SUSFS_SHA (see the list above)"; exit 1; }
+          done
+          cp "$PATCH" "$HOOKS" "$CLEAN" .
+          echo "---- clean_hook.sh (first 40 lines) ----"
+          head -40 clean_hook.sh
+          echo "---- susfs_inline_hook_patches.sh (first 40 lines) ----"
+          head -40 susfs_inline_hook_patches.sh
+          echo "---- 1/3: clean_hook.sh ----"
+          bash clean_hook.sh
+          echo "---- 2/3: susfs_inline_hook_patches.sh ----"
+          bash susfs_inline_hook_patches.sh
+          echo "---- 3/3: susfs_patch_to_4.14.patch ----"
+          patch -p1 --forward --batch --no-backup-if-mismatch < susfs_patch_to_4.14.patch || true
+          REJ="$(find . -name '*.rej' -not -path './out/*' -not -path './.git/*')"
+          if [ -n "$REJ" ]; then
+            echo "::error::SUSFS patch has rejected hunks (they must be ported to this tree)"
+            for f in $REJ; do echo "=== $f ==="; cat "$f"; done
             exit 1
           fi
-
-          # This kernel's struct cred has "atomic_long_t usage", but the get_cred_rcu() helper that the SUSFS
-          # Makefile injects into include/linux/cred.h uses atomic_inc_not_zero() (atomic_t) -> compile error everywhere.
-          if grep -Eq "atomic_long_t[[:space:]]+usage" include/linux/cred.h; then
-            sed -i 's/atomic_inc_not_zero(&nonconst_cred->usage)/atomic_long_inc_not_zero(\&nonconst_cred->usage)/' KernelSU/kernel/Makefile
-            echo "KernelSU Makefile: get_cred_rcu now uses atomic_long_inc_not_zero"
-          fi
-          grep -n "inc_not_zero" KernelSU/kernel/Makefile || { echo "::error::get_cred_rcu helper not found in KernelSU/kernel/Makefile"; exit 1; }
-
-          echo "---- 2/3: kernel side patch ----"
-          patch -p1 --batch --no-backup-if-mismatch < "$KPATCH" || true
-          cat > /tmp/kernel_fix.py <<'PY'
-          import pathlib, re, sys
-
-          def rd(p): return pathlib.Path(p).read_text()
-          def wr(p, t): pathlib.Path(p).write_text(t)
-
-          # fs/proc/task_mmu.c: include susfs_def.h (needed by the hunks that did apply)
-          p = "fs/proc/task_mmu.c"; t = rd(p)
-          if "susfs_def.h" not in t:
-              a = "#include <linux/uaccess.h>\n"
-              if a not in t: sys.exit("task_mmu.c: anchor not found")
-              wr(p, t.replace(a, a + "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n", 1))
-              print("task_mmu.c: include added")
-
-          # kernel/sys.c: uname spoof hook
-          p = "kernel/sys.c"; t = rd(p)
-          if "susfs_spoof_uname" not in t:
-              a = "SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)\n{"
-              if a not in t: sys.exit("sys.c: newuname not found")
-              t = t.replace(a, "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\nextern void susfs_spoof_uname(struct new_utsname* tmp);\n#endif\n" + a, 1)
-              m = re.search(r"SYSCALL_DEFINE1\(newuname.*?memcpy\(&tmp, utsname\(\), sizeof\(tmp\)\);\n", t, re.S)
-              if not m: sys.exit("sys.c: memcpy in newuname not found")
-              t = t[:m.end()] + "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n\tsusfs_spoof_uname(&tmp);\n#endif\n" + t[m.end():]
-              wr(p, t)
-              print("sys.c: uname spoof hook added")
-
-          # fs/proc/cmdline.c: cmdline spoof hook
-          p = "fs/proc/cmdline.c"; t = rd(p)
-          if "susfs_spoof_cmdline_or_bootconfig" not in t:
-              a = "static int cmdline_proc_show(struct seq_file *m, void *v)\n{\n"
-              if a not in t: sys.exit("cmdline.c: cmdline_proc_show not found")
-              t = t.replace(a,
-                  "#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\nextern int susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);\n#endif\n\n" + a +
-                  "#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n\tif (!susfs_spoof_cmdline_or_bootconfig(m)) {\n\t\tseq_putc(m, '\\n');\n\t\treturn 0;\n\t}\n#endif\n", 1)
-              wr(p, t)
-              print("cmdline.c: cmdline spoof hook added")
-          PY
-
-          python3 -I /tmp/kernel_fix.py
-          # these three .rej files were ported by kernel_fix.py above; anything else is a real failure
-          rm -f fs/proc/task_mmu.c.rej kernel/sys.c.rej fs/proc/cmdline.c.rej
-          if [ -n "$(find . -name '*.rej' -not -path './out/*' -not -path './KernelSU/*')" ]; then
-            echo "::error::SUSFS kernel patch has failing hunks"
-            for f in $(find . -name '*.rej' -not -path './out/*' -not -path './KernelSU/*'); do echo "=== $f ==="; cat "$f"; done
-            exit 1
-          fi
-
-          echo "---- 3/3: hook stubs ----"
-          # kernel/reboot.c calls ksu_handle_sys_reboot; this KernelSU version does not provide it
-          if ! grep -rq "ksu_handle_sys_reboot" KernelSU/kernel; then
-            cat > fs/ksu_susfs_stubs.c <<'EOF'
-          // SPDX-License-Identifier: GPL-2.0
-          #include <linux/types.h>
-          #include <linux/compiler.h>
-
-          int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg)
-          {
-          	return 0;
-          }
-          EOF
-            grep -q "ksu_susfs_stubs" fs/Makefile || echo 'obj-$(CONFIG_KSU) += ksu_susfs_stubs.o' >> fs/Makefile
-            echo "added ksu_handle_sys_reboot stub"
-          fi
-          git --no-pager diff --stat | tail -30 || true
-          echo "SUSFS_DESC=simonpunk/susfs4ksu kernel-4.14 @ $(git -C /tmp/susfs rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          rm -f clean_hook.sh susfs_inline_hook_patches.sh susfs_patch_to_4.14.patch
+          git --no-pager diff --stat | tail -40 || true
+          echo "SUSFS_DESC=JackA1ltman/NonGKI_Kernel_Build_2nd @ ${SUSFS_SHA} (susfs_patch_to_4.14.patch)" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         timeout-minutes: 25
@@ -553,10 +482,12 @@ jobs:
           grep -E "^CONFIG_NOMOUNT" out/.config || true
           grep -q "^CONFIG_NOMOUNT=y" out/.config || { echo "::error::CONFIG_NOMOUNT=y is not set in the final config"; sed -n '1,60p' fs/nomount/Kconfig 2>/dev/null || true; exit 1; }
           if [ "$ENABLE_SUSFS" = "true" ]; then
-            scripts/config --file out/.config -e KSU_SUSFS
+            # "SUSFS Inline Hook" is BakaSU's own hooking method: it replaces manual / tracepoint hook
+            scripts/config --file out/.config -e KSU -d KSU_MANUAL_HOOK -d KSU_TRACEPOINT_HOOK -e KSU_SUSFS \
+              -e KALLSYMS -e KALLSYMS_ALL
             make O=out ARCH=arm64 olddefconfig
-            grep -E "^CONFIG_KSU_SUSFS" out/.config || true
-            grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "::error::CONFIG_KSU_SUSFS=y is not set in the final config (symbol missing from KernelSU Kconfig?)"; exit 1; }
+            grep -E "^CONFIG_KSU|^CONFIG_KALLSYMS" out/.config || true
+            grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "::error::CONFIG_KSU_SUSFS=y is not set in the final config (see the BakaSU Kconfig dump above)"; grep -nE "^[[:space:]]*(menu)?config |depends on" drivers/kernelsu/Kconfig | head -60; exit 1; }
           fi
           if [ "${{ inputs.disable_lto }}" = "true" ]; then
             scripts/config --file out/.config -d LTO_CLANG -d THINLTO -e LTO_NONE
@@ -662,16 +593,6 @@ jobs:
           (cd AnyKernel3 && zip -r9 "../$ZIP" . -x '.git*')
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
           echo "short=$SHORT" >> "$GITHUB_OUTPUT"
-          # SUSFS: ship the userspace module that matches this kernel's SUSFS version (newer third-party
-          # modules talk to the kernel in a different way and fail with "SUSFS operation not supported")
-          if [ "$ENABLE_SUSFS" = "true" ] && [ -d /tmp/susfs/ksu_module_susfs ]; then
-            MV="$(grep '^version=' /tmp/susfs/ksu_module_susfs/module.prop | cut -d= -f2 | tr -d '\r')"
-            MZIP="susfs4ksu-module-${MV}.zip"
-            (cd /tmp/susfs/ksu_module_susfs && zip -r9 "$GITHUB_WORKSPACE/$MZIP" . -x '.git*')
-            echo "SUSFS_MODULE_ZIP=$MZIP" >> "$GITHUB_ENV"
-            echo "SUSFS_MODULE_VER=$MV" >> "$GITHUB_ENV"
-            ls -la "$MZIP"
-          fi
           ls -la "$ZIP"
 
       - name: Publish GitHub Release
@@ -686,12 +607,10 @@ jobs:
             echo "\`${{ steps.verify.outputs.krel }}\`"
             echo
             echo "- 🔑 **Root:** ${VARIANT_NAME}"
-            if [ "$ENABLE_SUSFS" != "true" ]; then
-              echo "- 📲 **Manager:** BakaSU manager (use a version matching this build)"
-            fi
+            echo "- 📲 **Manager:** BakaSU manager (use a version matching this build)"
             echo "- 📁 **NoMount:** built in (install the NoMount module after flashing)"
             if [ "$ENABLE_SUSFS" = "true" ]; then
-              echo "- 👻 **SUSFS ${SUSFS_MODULE_VER}:** built in. Flash the attached \`${SUSFS_MODULE_ZIP}\` as a module (other SUSFS modules need a newer kernel SUSFS and will not work)"
+              echo "- 👻 **SUSFS:** built in (${SUSFS_DESC}). It hides nothing until configured: use the SUSFS screen of the BakaSU manager"
             fi
             echo "- ⚙️ **Clang ${CLANG_ID}** · LTO ${LTO}"
             echo "- 🔖 **Commit:** ${{ steps.pack.outputs.short }}"
@@ -700,7 +619,6 @@ jobs:
             echo "> Flash in recovery. Back up boot first."
           } > notes.txt
           ASSETS=("${{ steps.pack.outputs.zip }}")
-          if [ -n "${SUSFS_MODULE_ZIP:-}" ] && [ -f "$SUSFS_MODULE_ZIP" ]; then ASSETS+=("$SUSFS_MODULE_ZIP"); fi
           # GitHub's API occasionally answers HTTP 5xx; the build takes ~40 min, so retry instead of losing it.
           # If an earlier attempt already created the release, only (re)upload the assets.
           for i in 1 2 3 4 5 6; do
