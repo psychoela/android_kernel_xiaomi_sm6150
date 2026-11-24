@@ -4,11 +4,12 @@ name: build
 # (sweet/sweetin) and publishes an AnyKernel3 zip as a GitHub Release. Nothing is
 # uploaded as an Actions artifact (avoids the artifact storage quota problem).
 #
-# Root solution: backslashxx/KernelSU (manual-hook KernelSU fork that still supports old kernels),
+# Root solution: Baka-SU/BakaSU (KernelSU downstream, formerly ReSukiSU) in MANUAL HOOK mode,
 # cloned at build time and wired in as drivers/kernelsu, plus NoMount (maxsteeel/nomount) integrated
 # into the kernel source with its setup.sh. No SUSFS for now.
-# The kernel tree's existing manual hooks (fs/exec.c, fs/open.c, ...) are used as they are;
-# if the fork expects different hook names the build log will show it.
+# The kernel tree's existing manual hooks (fs/exec.c, fs/open.c, ...) are used as they are, and
+# BakaSU checks at compile time that every required hook exists: if one is missing the build log
+# names it (see https://bakasu.org/guide/manual-integrate).
 #
 # Put this file at .github/workflows/build.yml in the ksu-next branch. Every push to
 # ksu-next starts a build. The manual "Run workflow" button only shows up if the file is
@@ -20,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       ksu_ref:
-        description: "backslashxx/KernelSU ref: 'latest' = tip of its default branch, or type a tag/branch/commit"
+        description: "Baka-SU/BakaSU ref: 'latest' = tip of main, or type a tag/branch/commit (e.g. v4.2.0-rc3)"
         type: string
         default: latest
       nomount_ref:
@@ -32,7 +33,7 @@ on:
         type: boolean
         default: false
       enable_susfs:
-        description: "EXPERIMENTAL: build with SUSFS (switches root to tiann/KernelSU, needs the official v0.9.5 manager). Off = backslashxx/KernelSU + NoMount"
+        description: "EXPERIMENTAL: build with SUSFS (switches root to tiann/KernelSU, needs the official v0.9.5 manager). Off = BakaSU + NoMount"
         type: boolean
         default: false
 
@@ -47,7 +48,7 @@ env:
   CLANG_ID: r563880c
   KBUILD_BUILD_USER: PsychoAvy
   KBUILD_BUILD_HOST: github
-  # SUSFS is OFF for push builds (backslashxx/KernelSU + NoMount); it is only built when a manual
+  # SUSFS is OFF for push builds (BakaSU + NoMount); it is only built when a manual
   # run ticks enable_susfs, which switches the root solution to tiann/KernelSU (see "Fetch KernelSU")
   ENABLE_SUSFS: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_susfs }}
 
@@ -76,13 +77,14 @@ jobs:
             KSU_REPO="tiann/KernelSU"
             [ "$REF" = "latest" ] && REF="bd5100d6"
           else
-            KSU_REPO="backslashxx/KernelSU"
+            KSU_REPO="Baka-SU/BakaSU"
           fi
+          # keep this a full clone: BakaSU's Kbuild derives its version from git history
           git clone --quiet "https://github.com/${KSU_REPO}" KernelSU
           echo "---- branches ----"
           git -C KernelSU branch -r | head -20
           if [ "$REF" != "latest" ]; then
-            git -C KernelSU rev-parse -q --verify "${REF}^{commit}" >/dev/null || git -C KernelSU rev-parse -q --verify "origin/${REF}^{commit}" >/dev/null || { echo "::error::ref '$REF' not found in backslashxx/KernelSU (see the branch list above)"; exit 1; }
+            git -C KernelSU rev-parse -q --verify "${REF}^{commit}" >/dev/null || git -C KernelSU rev-parse -q --verify "origin/${REF}^{commit}" >/dev/null || { echo "::error::ref '$REF' not found in ${KSU_REPO} (see the branch list above)"; exit 1; }
             git -C KernelSU checkout -q "$REF" 2>/dev/null || git -C KernelSU checkout -q "origin/$REF"
           fi
           SHORT="$(git -C KernelSU rev-parse --short HEAD)"
@@ -101,9 +103,9 @@ jobs:
             echo "VARIANT_NAME=KernelSU ${SHORT} + SUSFS" >> "$GITHUB_ENV"
             echo "SLUG=susfs" >> "$GITHUB_ENV"
           else
-            echo "VARIANT=xxksu" >> "$GITHUB_ENV"
-            echo "VARIANT_NAME=backslashxx KernelSU ${DESC}" >> "$GITHUB_ENV"
-            echo "SLUG=xxksu" >> "$GITHUB_ENV"
+            echo "VARIANT=bakasu" >> "$GITHUB_ENV"
+            echo "VARIANT_NAME=BakaSU ${DESC}" >> "$GITHUB_ENV"
+            echo "SLUG=bakasu" >> "$GITHUB_ENV"
           fi
           echo "KSU_DESC=${KSU_REPO} @ ${SHORT} (${DESC})" >> "$GITHUB_ENV"
 
@@ -150,33 +152,82 @@ jobs:
           done || true
           echo "---- end ----"
 
-      # The kernel tree was prepared for KernelSU-Next (legacy). backslashxx/KernelSU uses the
-      # "scope-minimized manual hooks" layout (backslashxx/KernelSU#5), which differs in two places:
-      #  1. fs/read_write.c still calls ksu_vfs_read_hook / ksu_handle_sys_read, which the fork does not
-      #     provide (init.rc is handled through an LSM hook instead). Define them as inert stubs so the
-      #     link succeeds; the flag stays false, so the old read hook never runs.
+      # The kernel tree was prepared for KernelSU-Next (legacy). BakaSU uses the "scope-minimized
+      # manual hooks" layout (adapted from backslashxx/KernelSU#5), which differs in a few places:
+      #  1. The old read / input / setuid hooks (ksu_vfs_read_hook, ksu_input_hook, ksu_handle_setresuid)
+      #     are not provided by BakaSU: on kernels < 6.8 it applies them itself (LSM / input handler)
+      #     when CONFIG_KSU_MANUAL_HOOK_AUTO_{INITRC,INPUT,SETUID}_HOOK are on (set in "Configure kernel").
+      #     The legacy blocks are stripped from the tree so they cannot clash; weak stubs for the two
+      #     read symbols stay as a safety net so the link succeeds either way.
       #  2. fs/stat.c needs the newfstat return hook, otherwise init never sees the enlarged init.rc
       #     (required on Android 16+, harmless on older).
-      - name: Adapt manual hooks for backslashxx/KernelSU
+      - name: Adapt manual hooks for BakaSU
         if: env.ENABLE_SUSFS != 'true'
         run: |
           set -e
           cat > fs/ksu_hook_stubs.c <<'EOF'
           // SPDX-License-Identifier: GPL-2.0
-          /* Inert stubs for the old KernelSU-Next read hook still referenced by fs/read_write.c. */
+          /* Weak, inert stubs for the old KernelSU-Next read hook that fs/read_write.c may still reference. */
           #include <linux/types.h>
           #include <linux/compiler.h>
           #include <linux/cache.h>
           #include <linux/uaccess.h>
 
-          bool ksu_vfs_read_hook __read_mostly = false;
+          bool ksu_vfs_read_hook __read_mostly __weak = false;
 
-          int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr)
+          int __weak ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr)
           {
           	return 0;
           }
           EOF
           grep -q "ksu_hook_stubs" fs/Makefile || echo 'obj-$(CONFIG_KSU) += ksu_hook_stubs.o' >> fs/Makefile
+          python3 - <<'PY2'
+          import re, pathlib
+
+          # legacy KernelSU-Next hooks that BakaSU replaces with its own automatic (LSM / input handler) hooks
+          TARGETS = {
+              "fs/read_write.c": ("ksu_vfs_read_hook", "ksu_handle_sys_read", "ksu_handle_vfs_read"),
+              "drivers/input/input.c": ("ksu_input_hook", "ksu_handle_input_handle_event"),
+              "kernel/sys.c": ("ksu_handle_setresuid",),
+          }
+
+          def strip_legacy(path, names):
+              p = pathlib.Path(path)
+              if not p.exists():
+                  print(path + ": not found, skipped")
+                  return
+              lines = p.read_text().splitlines(keepends=True)
+              out, i, removed = [], 0, 0
+              while i < len(lines):
+                  s = lines[i].lstrip()
+                  # only plain '#ifdef CONFIG_KSU' style guards; BakaSU-style CONFIG_KSU_MANUAL_HOOK blocks stay
+                  if re.match(r"#\s*if", s) and "CONFIG_KSU" in s and "CONFIG_KSU_MANUAL_HOOK" not in s:
+                      depth, j, has_else = 0, i, False
+                      while j < len(lines):
+                          t = lines[j].lstrip()
+                          if re.match(r"#\s*if", t):
+                              depth += 1
+                          elif re.match(r"#\s*el", t) and depth == 1:
+                              has_else = True
+                          elif re.match(r"#\s*endif", t):
+                              depth -= 1
+                              if depth == 0:
+                                  break
+                          j += 1
+                      block = "".join(lines[i:j + 1])
+                      if j < len(lines) and not has_else and any(n in block for n in names):
+                          removed += 1
+                          i = j + 1
+                          continue
+                  out.append(lines[i])
+                  i += 1
+              if removed:
+                  p.write_text("".join(out))
+              print("%s: removed %d legacy KSU block(s)" % (path, removed))
+
+          for f, names in TARGETS.items():
+              strip_legacy(f, names)
+          PY2
           python3 - <<'PY'
           import re, sys, pathlib
           p = pathlib.Path("fs/stat.c")
@@ -191,15 +242,17 @@ jobs:
           if "\treturn error;\n}" not in body:
               sys.exit("unexpected newfstat body:\n" + body)
           new = body.replace("\treturn error;\n}",
-              "#if defined(CONFIG_KSU) && !defined(CONFIG_KSU_KPROBES_KSUD)\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif\n\treturn error;\n}", 1)
-          decl = ("#if defined(CONFIG_KSU) && !defined(CONFIG_KSU_KPROBES_KSUD)\n"
+              "#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif\n\treturn error;\n}", 1)
+          decl = ("#ifdef CONFIG_KSU_MANUAL_HOOK\n"
                   "extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);\n"
                   "#endif\n\n")
           p.write_text(text[:m.start()] + decl + new + text[m.end():])
           print("fs/stat.c: newfstat hook added")
           PY
-          git --no-pager diff --stat -- fs/stat.c fs/Makefile || true
+          git --no-pager diff --stat -- fs/stat.c fs/Makefile fs/read_write.c drivers/input/input.c kernel/sys.c || true
           grep -n -B3 -A3 "ksu_handle_newfstat_ret" fs/stat.c | head -30
+          echo "---- legacy KSU symbols still referenced in the tree (expect none outside the weak stubs) ----"
+          grep -rnE "ksu_vfs_read_hook|ksu_input_hook|ksu_handle_input_handle_event|ksu_handle_vfs_read|ksu_handle_setresuid" fs kernel drivers/input include 2>/dev/null | grep -v ksu_hook_stubs || true
 
       # EXPERIMENTAL. SUSFS kernel-4.14 patches (simonpunk/susfs4ksu, pinned) + tiann/KernelSU @ bd5100d6.
       # Known gaps handled here: one KernelSU hunk (selinux.c) and three optional kernel hunks
@@ -478,6 +531,17 @@ jobs:
             done
             grep -E "^CONFIG_(KSU|KPROBES|MODULES|OVERLAY_FS)=" out/.config || true
           fi
+          # BakaSU hook mode: manual hooks (the tracepoint hook is GKI 2.0 only). On kernels < 6.8 the
+          # setuid / init.rc / input hooks are applied automatically via LSM / input handler, and
+          # KALLSYMS_ALL spares us from un-static'ing the SELinux symbols BakaSU would otherwise check for.
+          if [ "$ENABLE_SUSFS" != "true" ]; then
+            scripts/config --file out/.config -e KSU -d KSU_TRACEPOINT_HOOK -e KSU_MANUAL_HOOK \
+              -e KSU_MANUAL_HOOK_AUTO_SETUID_HOOK -e KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
+              -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK -e KALLSYMS -e KALLSYMS_ALL
+            make O=out ARCH=arm64 olddefconfig
+            grep -E "^CONFIG_KSU|^CONFIG_KALLSYMS" out/.config || true
+            grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config || { echo "::error::CONFIG_KSU_MANUAL_HOOK=y is not set in the final config (symbol missing from BakaSU Kconfig?)"; grep -nE "^[[:space:]]*(menu)?config |depends on" drivers/kernelsu/Kconfig | head -60; exit 1; }
+          fi
           # NoMount (maxsteeel/nomount) was copied into fs/nomount by the previous steps
           scripts/config --file out/.config -e NOMOUNT
           make O=out ARCH=arm64 olddefconfig
@@ -536,11 +600,11 @@ jobs:
           echo "Image: $KIMG"
           ls -la "$BOOT"
           # The root solution must really be compiled in
-          COUNT="$(strings -n 8 out/arch/arm64/boot/Image | grep -ciE "KernelSU|FinaSU" || true)"
+          COUNT="$(strings -n 8 out/arch/arm64/boot/Image | grep -ciE "KernelSU|FinaSU|BakaSU" || true)"
           if [ "${COUNT:-0}" -eq 0 ]; then
-            echo "::error::No KernelSU/FinaSU strings found in the kernel image"; exit 1
+            echo "::error::No KernelSU/BakaSU strings found in the kernel image"; exit 1
           fi
-          echo "KernelSU/FinaSU strings found in Image: $COUNT"
+          echo "KernelSU/BakaSU strings found in Image: $COUNT"
           NMC="$(strings -n 6 out/arch/arm64/boot/Image | grep -ci "nomount" || true)"
           if [ "${NMC:-0}" -eq 0 ]; then
             echo "::error::No NoMount strings found in the kernel image"; exit 1
@@ -622,6 +686,9 @@ jobs:
             echo "\`${{ steps.verify.outputs.krel }}\`"
             echo
             echo "- 🔑 **Root:** ${VARIANT_NAME}"
+            if [ "$ENABLE_SUSFS" != "true" ]; then
+              echo "- 📲 **Manager:** BakaSU manager (use a version matching this build)"
+            fi
             echo "- 📁 **NoMount:** built in (install the NoMount module after flashing)"
             if [ "$ENABLE_SUSFS" = "true" ]; then
               echo "- 👻 **SUSFS ${SUSFS_MODULE_VER}:** built in. Flash the attached \`${SUSFS_MODULE_ZIP}\` as a module (other SUSFS modules need a newer kernel SUSFS and will not work)"
