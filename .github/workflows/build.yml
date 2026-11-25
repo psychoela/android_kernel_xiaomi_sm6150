@@ -46,9 +46,9 @@ on:
         type: boolean
         default: true
       fgetpriority_ref:
-        description: "aerath-stuff/fgetpriority branch/tag/commit (default lkm = repo default branch; master is the older line)"
+        description: "aerath-stuff/fgetpriority branch/tag/commit (default master = the repo's current default branch)"
         type: string
-        default: lkm
+        default: master
 
 permissions:
   contents: write
@@ -458,7 +458,7 @@ jobs:
           IN_FGP_REF: ${{ inputs.fgetpriority_ref }}
         run: |
           set -e
-          REF="${IN_FGP_REF:-lkm}"
+          REF="${IN_FGP_REF:-master}"
           rm -rf fgetpriority drivers/fgetpriority
           git clone --quiet https://github.com/aerath-stuff/fgetpriority fgetpriority
           git -C fgetpriority checkout -q "$REF" || { echo "::error::ref '$REF' not found in aerath-stuff/fgetpriority"; git -C fgetpriority branch -r; exit 1; }
