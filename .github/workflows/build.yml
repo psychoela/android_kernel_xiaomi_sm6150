@@ -418,6 +418,13 @@ jobs:
           ""])
                   wr(p, t[:m.start()] + new + t[m.end():])
               drop(p); print(p + ": ported")
+          # fs/mount.h has no include guard on 4.14, and fs/stat.c ends up including "mount.h" twice (once from the
+          # tree / NoMount, once from the SUSFS patch) -> "redefinition of 'mount'" etc. Guard it once for all users.
+          p = "fs/mount.h"
+          t = rd(p)
+          if "#pragma once" not in t:
+              wr(p, "#pragma once\n" + t)
+              print(p + ": #pragma once added")
           PY
           python3 /tmp/susfs_port.py
           REJ="$(find . -name '*.rej' -not -path './out/*' -not -path './.git/*')"
