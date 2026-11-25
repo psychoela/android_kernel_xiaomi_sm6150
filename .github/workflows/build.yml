@@ -41,6 +41,14 @@ on:
         description: "JackA1ltman/NonGKI_Kernel_Build_2nd ref that carries the 4.14 SUSFS patch (default = pinned commit, SUSFS v2.4.0)"
         type: string
         default: ec069a4e34f992d602a6b40d2e211df2516e2865
+      enable_fgetpriority:
+        description: "Build in fgetpriority (hides getpriority/ioprio side-channel for HMA). Untick to rule it out if a build fails or boot-loops"
+        type: boolean
+        default: true
+      fgetpriority_ref:
+        description: "aerath-stuff/fgetpriority branch/tag/commit (default lkm = repo default branch; master is the older line)"
+        type: string
+        default: lkm
 
 permissions:
   contents: write
@@ -56,6 +64,8 @@ env:
   # SUSFS is OFF for push builds (BakaSU manual hooks + NoMount); it is only built when a manual
   # run ticks enable_susfs, which switches BakaSU to its SUSFS Inline Hook mode
   ENABLE_SUSFS: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_susfs }}
+  # fgetpriority (built in) is ON for push builds; a manual run can untick enable_fgetpriority
+  ENABLE_FGETPRIORITY: ${{ github.event_name != 'workflow_dispatch' || inputs.enable_fgetpriority }}
 
 jobs:
   build:
@@ -437,6 +447,45 @@ jobs:
           git --no-pager diff --stat | tail -40 || true
           echo "SUSFS_DESC=JackA1ltman/NonGKI_Kernel_Build_2nd @ ${SUSFS_SHA} (susfs_patch_to_4.14.patch)" >> "$GITHUB_ENV"
 
+      # fgetpriority (aerath-stuff/fgetpriority, kernel/): small module that filters sys_getpriority / setpriority /
+      # ioprio_get / ioprio_set (helper for HMA). Built in, wired the same way as BakaSU: cloned next to the tree,
+      # kernel/ symlinked as drivers/fgetpriority, hooked into drivers/Makefile + drivers/Kconfig, CONFIG_FGETPRIORITY=y
+      # is set in "Configure kernel". Needs ARM64 + KALLSYMS only. Runs after the SUSFS step on purpose
+      # (clean_hook.sh edits drivers/Makefile / drivers/Kconfig).
+      - name: Integrate fgetpriority into the kernel
+        if: env.ENABLE_FGETPRIORITY == 'true'
+        env:
+          IN_FGP_REF: ${{ inputs.fgetpriority_ref }}
+        run: |
+          set -e
+          REF="${IN_FGP_REF:-lkm}"
+          rm -rf fgetpriority drivers/fgetpriority
+          git clone --quiet https://github.com/aerath-stuff/fgetpriority fgetpriority
+          git -C fgetpriority checkout -q "$REF" || { echo "::error::ref '$REF' not found in aerath-stuff/fgetpriority"; git -C fgetpriority branch -r; exit 1; }
+          FGP_SHA="$(git -C fgetpriority rev-parse --short HEAD)"
+          echo "fgetpriority @ $REF ($FGP_SHA)"
+          ls -la fgetpriority/kernel
+          for f in Makefile Kconfig main.c; do
+            [ -f "fgetpriority/kernel/$f" ] || { echo "::error::fgetpriority/kernel/$f missing at ref '$REF' (layout changed?)"; exit 1; }
+          done
+          ln -s ../fgetpriority/kernel drivers/fgetpriority
+          grep -q "CONFIG_FGETPRIORITY" drivers/Makefile || echo 'obj-$(CONFIG_FGETPRIORITY) += fgetpriority/' >> drivers/Makefile
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("drivers/Kconfig")
+          t = p.read_text()
+          line = 'source "drivers/fgetpriority/Kconfig"\n'
+          if line not in t:
+              i = t.rfind("\nendmenu")
+              t = (t[:i + 1] + line + t[i + 1:]) if i != -1 else (t.rstrip("\n") + "\n" + line)
+              p.write_text(t)
+          PY
+          echo "---- drivers/Makefile / drivers/Kconfig hooks ----"
+          grep -n "fgetpriority" drivers/Makefile drivers/Kconfig
+          echo "---- fgetpriority/kernel/Makefile ----"; cat fgetpriority/kernel/Makefile
+          echo "---- fgetpriority/kernel/Kconfig ----"; cat fgetpriority/kernel/Kconfig
+          echo "FGP_DESC=aerath-stuff/fgetpriority @ ${REF} (${FGP_SHA})" >> "$GITHUB_ENV"
+
       - name: Install build dependencies
         timeout-minutes: 25
         run: |
@@ -615,6 +664,17 @@ jobs:
             grep -E "^CONFIG_KSU|^CONFIG_KALLSYMS" out/.config || true
             grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "::error::CONFIG_KSU_SUSFS=y is not set in the final config (see the BakaSU Kconfig dump above)"; grep -nE "^[[:space:]]*(menu)?config |depends on" drivers/kernelsu/Kconfig | head -60; exit 1; }
           fi
+          if [ "$ENABLE_FGETPRIORITY" = "true" ]; then
+            scripts/config --file out/.config -e KALLSYMS -e KALLSYMS_ALL -e FGETPRIORITY
+            make O=out ARCH=arm64 olddefconfig
+            if ! grep -q "^CONFIG_FGETPRIORITY=y" out/.config; then
+              echo "---- CONFIG_FGETPRIORITY is off; resolving its dependencies ----"
+              python3 /tmp/ksu_deps.py FGETPRIORITY || true
+              make O=out ARCH=arm64 olddefconfig
+            fi
+            grep -E "^CONFIG_FGETPRIORITY|^CONFIG_KALLSYMS|^CONFIG_MODULES=" out/.config || true
+            grep -q "^CONFIG_FGETPRIORITY=y" out/.config || { echo "::error::CONFIG_FGETPRIORITY=y is not set in the final config"; cat drivers/fgetpriority/Kconfig; exit 1; }
+          fi
           if [ "${{ inputs.disable_lto }}" = "true" ]; then
             scripts/config --file out/.config -d LTO_CLANG -d THINLTO -e LTO_NONE
             make O=out ARCH=arm64 olddefconfig
@@ -667,6 +727,11 @@ jobs:
             echo "::error::No NoMount strings found in the kernel image"; exit 1
           fi
           echo "NoMount strings found in Image: $NMC"
+          if [ "$ENABLE_FGETPRIORITY" = "true" ]; then
+            FGC="$(strings -n 6 out/arch/arm64/boot/Image | grep -ci "fgetpriority" || true)"
+            echo "fgetpriority strings found in Image: ${FGC:-0}"
+            [ "${FGC:-0}" -gt 0 ] || echo "::warning::No fgetpriority strings in the kernel image (init code may have been discarded; check dmesg for 'fgetpriority:' after boot)"
+          fi
           if [ "$ENABLE_SUSFS" = "true" ]; then
             SUC="$(strings -n 6 out/arch/arm64/boot/Image | grep -ci "susfs" || true)"
             if [ "${SUC:-0}" -eq 0 ]; then
@@ -735,6 +800,9 @@ jobs:
             echo "- 🔑 **Root:** ${VARIANT_NAME}"
             echo "- 📲 **Manager:** BakaSU manager (use a version matching this build)"
             echo "- 📁 **NoMount:** built in (install the NoMount module after flashing)"
+            if [ "$ENABLE_FGETPRIORITY" = "true" ]; then
+              echo "- 🧷 **fgetpriority:** built in (${FGP_DESC})"
+            fi
             if [ "$ENABLE_SUSFS" = "true" ]; then
               echo "- 👻 **SUSFS:** built in (${SUSFS_DESC}). It hides nothing until configured: use the SUSFS screen of the BakaSU manager"
             fi
