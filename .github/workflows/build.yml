@@ -266,9 +266,12 @@ jobs:
       # EXPERIMENTAL. SUSFS for BakaSU on Linux 4.14. simonpunk's own kernel-4.14 patch is far older than what
       # BakaSU's "SUSFS Inline Hook" mode expects, so this uses the non-GKI backport from
       # JackA1ltman/NonGKI_Kernel_Build_2nd (Patches/Patch/susfs_patch_to_4.14.patch, SUSFS v2.4.0) and the
-      # flow its wiki describes for BakaSU: clean_hook.sh (strip the old KSU hooks) -> BakaSU (set up above)
-      # -> susfs_inline_hook_patches.sh -> susfs patch. BakaSU's manual hooks are not used in this mode
-      # (KSU_SUSFS replaces KSU_MANUAL_HOOK). If anything fails the log lists the files found and the rejects.
+      # flow its wiki describes for BakaSU: clean_hook.sh (strip the old KSU hooks) -> BakaSU ->
+      # susfs_inline_hook_patches.sh -> susfs patch. clean_hook.sh also deletes KernelSU/ and drivers/kernelsu,
+      # so BakaSU is parked and put back around it. Four hunks of the 4.14 patch do not apply to this tree
+      # (kernel/sys.c, fs/proc/task_mmu.c, fs/proc/cmdline.c, fs/stat.c): they are ported by a small script.
+      # BakaSU's manual hooks are not used in this mode (KSU_SUSFS replaces KSU_MANUAL_HOOK).
+      # If anything else fails the log lists the files found and the rejects.
       - name: Integrate SUSFS (BakaSU inline hooks, experimental)
         if: env.ENABLE_SUSFS == 'true'
         env:
@@ -295,12 +298,128 @@ jobs:
           head -40 clean_hook.sh
           echo "---- susfs_inline_hook_patches.sh (first 40 lines) ----"
           head -40 susfs_inline_hook_patches.sh
-          echo "---- 1/3: clean_hook.sh ----"
+          echo "---- 1/4: clean_hook.sh (BakaSU parked meanwhile: the script deletes KernelSU/ and drivers/kernelsu) ----"
+          rm -rf /tmp/KernelSU_keep
+          mv KernelSU /tmp/KernelSU_keep
+          rm -f drivers/kernelsu
           bash clean_hook.sh
-          echo "---- 2/3: susfs_inline_hook_patches.sh ----"
+          rm -rf KernelSU drivers/kernelsu
+          mv /tmp/KernelSU_keep KernelSU
+          ln -s ../KernelSU/kernel drivers/kernelsu
+          ls -la drivers/kernelsu
+          echo "---- 2/4: susfs_inline_hook_patches.sh ----"
           bash susfs_inline_hook_patches.sh
-          echo "---- 3/3: susfs_patch_to_4.14.patch ----"
+          echo "---- 3/4: susfs_patch_to_4.14.patch ----"
           patch -p1 --forward --batch --no-backup-if-mismatch < susfs_patch_to_4.14.patch || true
+          echo "---- 4/4: port the hunks that do not apply to this tree ----"
+          cat > /tmp/susfs_port.py <<'PY'
+          import pathlib, re, sys
+
+          def rd(p): return pathlib.Path(p).read_text()
+          def wr(p, t): pathlib.Path(p).write_text(t)
+          def rej(p):
+              r = pathlib.Path(p + ".rej")
+              return r.exists()
+          def drop(p): pathlib.Path(p + ".rej").unlink()
+
+          # kernel/sys.c: uname spoof
+          p = "kernel/sys.c"
+          if rej(p):
+              t = rd(p)
+              if "susfs_is_uname_spoof_buffer_set" not in t:
+                  a = "SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)\n{"
+                  if a not in t: sys.exit("sys.c: newuname not found")
+                  t = t.replace(a, "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\nextern struct static_key_false susfs_is_uname_spoof_buffer_set;\nextern void susfs_spoof_uname(struct new_utsname* tmp);\n#endif\n" + a, 1)
+                  m = re.search(r"SYSCALL_DEFINE1\(newuname.*?memcpy\(&tmp, utsname\(\), sizeof\(tmp\)\);\n", t, re.S)
+                  if not m: sys.exit("sys.c: memcpy in newuname not found")
+                  t = t[:m.end()] + "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n\tif (static_branch_likely(&susfs_is_uname_spoof_buffer_set))\n\t\tsusfs_spoof_uname(&tmp);\n#endif\n" + t[m.end():]
+                  wr(p, t)
+              drop(p); print(p + ": ported")
+
+          # fs/proc/task_mmu.c: susfs_def.h include
+          p = "fs/proc/task_mmu.c"
+          if rej(p):
+              t = rd(p)
+              if "susfs_def.h" not in t:
+                  blk = "#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux/susfs_def.h>\n#endif\n"
+                  for a in ("#include <linux/ctype.h>\n", "#include <linux/uaccess.h>\n"):
+                      if a in t:
+                          wr(p, t.replace(a, a + blk, 1)); break
+                  else:
+                      sys.exit("task_mmu.c: no include anchor found")
+              drop(p); print(p + ": ported")
+
+          # fs/proc/cmdline.c: cmdline spoof
+          p = "fs/proc/cmdline.c"
+          if rej(p):
+              t = rd(p)
+              if "susfs_spoof_cmdline_or_bootconfig" not in t:
+                  a = "static int cmdline_proc_show(struct seq_file *m, void *v)\n{\n"
+                  if a not in t: sys.exit("cmdline.c: cmdline_proc_show not found")
+                  t = t.replace(a,
+                      "#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\nextern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;\nextern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);\n#endif\n\n" + a +
+                      "#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n\tif (static_branch_likely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {\n\t\tsusfs_spoof_cmdline_or_bootconfig(m);\n\t\tseq_putc(m, '\\n');\n\t\treturn 0;\n\t}\n#endif\n", 1)
+                  wr(p, t)
+              drop(p); print(p + ": ported")
+
+          # fs/stat.c: sus_kstat in vfs_getattr_nosec
+          p = "fs/stat.c"
+          if rej(p):
+              t = rd(p)
+              if "STATX_SUS_KSTAT_FUSE" not in t:
+                  m = re.search(r"\tif \(inode->i_op->getattr\)\n\t\treturn inode->i_op->getattr\(path, stat, request_mask,\n\s*query_flags\);\n", t)
+                  if not m:
+                      i = t.find("vfs_getattr_nosec(")
+                      print(t[i:i + 1200])
+                      sys.exit("stat.c: getattr call in vfs_getattr_nosec not found (function printed above)")
+                  new = "\n".join([
+          "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT",
+          "\tif (susfs_is_current_app_uid()) {",
+          "\t\tbool is_fuse = false;",
+          "\t\tif (susfs_is_inode_sus_kstat(d_backing_inode(path->dentry), &is_fuse)) {",
+          "\t\t\tif (!is_fuse)",
+          "\t\t\t\tstat->result_mask |= STATX_SUS_KSTAT;",
+          "\t\t\tstat->result_mask |= STATX_SUS_KSTAT_FUSE;",
+          "\t\t}",
+          "\t}",
+          "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT",
+          "",
+          "\tif (inode->i_op->getattr)",
+          "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT",
+          "\t{",
+          "\t\tint err = inode->i_op->getattr(path, stat, request_mask,",
+          "\t\t\t\t\t    query_flags);",
+          "\t\tif (!err) {",
+          "\t\t\tif (stat->result_mask & STATX_SUS_KSTAT) {",
+          "\t\t\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat, STATX_SUS_KSTAT);",
+          "\t\t\t\treturn err;",
+          "\t\t\t}",
+          "\t\t\tif (stat->result_mask & STATX_SUS_KSTAT_FUSE) {",
+          "\t\t\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat, STATX_SUS_KSTAT_FUSE);",
+          "\t\t\t\treturn err;",
+          "\t\t\t}",
+          "\t\t}",
+          "\t\treturn err;",
+          "\t}",
+          "\tif (stat->result_mask & STATX_SUS_KSTAT) {",
+          "\t\tgeneric_fillattr(inode, stat);",
+          "\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat, STATX_SUS_KSTAT);",
+          "\t\treturn 0;",
+          "\t}",
+          "\tif (stat->result_mask & STATX_SUS_KSTAT_FUSE) {",
+          "\t\tgeneric_fillattr(inode, stat);",
+          "\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat, STATX_SUS_KSTAT_FUSE);",
+          "\t\treturn 0;",
+          "\t}",
+          "#else",
+          "\t\treturn inode->i_op->getattr(path, stat, request_mask,",
+          "\t\t\t\t\t    query_flags);",
+          "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT",
+          ""])
+                  wr(p, t[:m.start()] + new + t[m.end():])
+              drop(p); print(p + ": ported")
+          PY
+          python3 /tmp/susfs_port.py
           REJ="$(find . -name '*.rej' -not -path './out/*' -not -path './.git/*')"
           if [ -n "$REJ" ]; then
             echo "::error::SUSFS patch has rejected hunks (they must be ported to this tree)"
